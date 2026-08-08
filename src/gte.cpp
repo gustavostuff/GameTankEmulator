@@ -11,6 +11,8 @@
 #include <thread>
 #include <algorithm>
 #include <cctype>
+#include <cstdarg>
+#include <errno.h>
 #ifdef WASM_BUILD
 #include "emscripten.h"
 #include <emscripten/html5.h>
@@ -27,6 +29,22 @@
 #include "system_state.h"
 #include "emulator_config.h"
 #include "game_config.h"
+
+static void RomDbg(const char* msg) {
+	if(!EmulatorConfig::romDebug) return;
+	printf("[rom %u ms] %s\n", (unsigned)SDL_GetTicks(), msg);
+	fflush(stdout);
+}
+
+static void RomDbgf(const char* fmt, ...) {
+	if(!EmulatorConfig::romDebug) return;
+	printf("[rom %u ms] ", (unsigned)SDL_GetTicks());
+	va_list ap;
+	va_start(ap, fmt);
+	vprintf(fmt, ap);
+	va_end(ap);
+	fflush(stdout);
+}
 
 #include "mos6502/mos6502.h"
 
@@ -906,12 +924,19 @@ void RefreshWrapperRomList() {
 	printf("Found %zu ROM(s) in %s\n", wrapperRomList.size(), romsDir.c_str());
 }
 
+static void WrapperRomDbg(const char* msg) {
+	RomDbg(msg);
+}
+
 bool OpenWrapperRom(const std::filesystem::path& path) {
 	const std::string pathStr = path.string();
-	printf("Opening ROM: %s\n", pathStr.c_str());
+	WrapperRomDbg(("open begin: " + pathStr).c_str());
+	RomDbgf("paused=%d romLoaded=%d showMenu=%d cartSize=%d\n",
+		(int)paused, (int)romLoaded, (int)showMenu, cartridge_state.size);
 
 	// Pause while swapping so the old game does not keep running mid-load.
 	// Do not wipe the cartridge until the new file is confirmed loaded.
+	WrapperRomDbg("PauseEmulation");
 	PauseEmulation();
 	if(joysticks) {
 		joysticks->SetHeldButtons(0);
@@ -919,31 +944,42 @@ bool OpenWrapperRom(const std::filesystem::path& path) {
 	}
 	cartridge_state.write_mode = false;
 
+	WrapperRomDbg("LoadRomFile...");
 	if(LoadRomFile(pathStr.c_str()) != 0) {
+		WrapperRomDbg("LoadRomFile FAILED");
 		printf("Failed to load ROM: %s\n", pathStr.c_str());
+		fflush(stdout);
 		// Keep whatever was already in memory and unstick pause so the UI is usable
 		ResumeEmulation();
+		WrapperRomDbg("resumed after failure");
 		return false;
 	}
+	WrapperRomDbg("LoadRomFile OK");
 
 	// Bytes past the new ROM size must not keep data from a previous larger cart
 	if(cartridge_state.rom && cartridge_state.size > 0 && cartridge_state.size < (1 << 21)) {
+		WrapperRomDbg("padding cart tail with 0xFF");
 		memset(cartridge_state.rom + cartridge_state.size, 0xFF, (size_t)((1 << 21) - cartridge_state.size));
 	}
 
 	romLoaded = true;
 	showMenu = false;
 	SyncWrapperMenuInput();
+	WrapperRomDbg("cpu Reset");
 	cpu_core->Reset();
 	cartridge_state.write_mode = false;
 	if(joysticks) {
 		joysticks->Reset();
 	}
 	ResumeEmulation();
+	RomDbgf("open done (paused=%d romLoaded=%d cartSize=%d)\n",
+		(int)paused, (int)romLoaded, cartridge_state.size);
 	return true;
 }
 
 void QueueWrapperRomOpen(const std::filesystem::path& path) {
+	RomDbgf("queue open: %s (was romLoaded=%d)\n",
+		path.string().c_str(), (int)romLoaded);
 	wrapperPendingRom = path;
 	wrapperRomLoadQueued = true;
 	showMenu = false;
@@ -952,13 +988,17 @@ void QueueWrapperRomOpen(const std::filesystem::path& path) {
 
 void ProcessQueuedWrapperRomOpen() {
 	if(!wrapperRomLoadQueued) return;
+	WrapperRomDbg("process queued open");
 	wrapperRomLoadQueued = false;
 	const std::filesystem::path path = wrapperPendingRom;
 	wrapperPendingRom.clear();
 	if(!OpenWrapperRom(path)) {
+		WrapperRomDbg("open failed -> reopen menu");
 		showMenu = true;
 		menuOpening = true;
 		wrapperForceTab = TAB_GAMES;
+	} else {
+		WrapperRomDbg("process queued open finished OK");
 	}
 }
 
@@ -1376,15 +1416,16 @@ extern "C" {
 			printf("default source map file %s not found\n", defaultSourceMapFilePath.c_str());
 		}
 
-		printf("loading %s\n", filename);
+		RomDbgf("fopen %s\n", filename);
 		FILE* romFileP = fopen(filename, "rb");
 		if(!romFileP) {
-			printf("Unable to open file: %s\n", filename);
+			RomDbgf("Unable to open file: %s (errno=%d)\n", filename, errno);
 			return -1;
 		}
 
 		fseek(romFileP, 0L, SEEK_END);
 		long fileSize = ftell(romFileP);
+		RomDbgf("size=%ld\n", fileSize);
 		constexpr long kMaxRomBytes = 1L << 21; // 2MB cartridge buffer
 		if(fileSize <= 0 || fileSize > kMaxRomBytes) {
 			printf("Invalid ROM size: %ld bytes (max %ld)\n", fileSize, kMaxRomBytes);
@@ -1412,10 +1453,12 @@ extern "C" {
 			printf("Unknown ROM type: Size is %d bytes\n", cartridge_state.size);
 			break;
 		}
+		RomDbgf("fread %d bytes...\n", cartridge_state.size);
 		const size_t got = fread(cartridge_state.rom, sizeof(uint8_t), (size_t)cartridge_state.size, romFileP);
+		RomDbgf("fread done got=%zu\n", got);
 		fclose(romFileP);
 		if(got != (size_t)cartridge_state.size) {
-			printf("Short ROM read: got %zu of %d bytes\n", got, cartridge_state.size);
+			RomDbgf("Short ROM read: got %zu of %d bytes\n", got, cartridge_state.size);
 			return -1;
 		}
 		if(cpu_core) {
@@ -1425,10 +1468,12 @@ extern "C" {
 		}
 
 		if(loadedRomType == RomType::FLASH2M) {
+			RomDbgf("FLASH2M post-load (xor=%s)\n", flashFileFullPath.c_str());
 
 			if(std::filesystem::exists(flashFileFullPath.c_str())) {
 				std::cout << "Loading flash save from " << flashFileFullPath << "\n";
 				LoadModifiedFlash();
+				RomDbg("LoadModifiedFlash done");
 			} else {
 				std::cout << "Couldn't find " << flashFileFullPath << "\n";
 			}
@@ -1440,10 +1485,13 @@ extern "C" {
 				(cartridge_state.rom[0x1FFFF3] == 'E')) {
 					loadedRomType = RomType::FLASH2M_RAM32K;
 					if(std::filesystem::exists(nvramFileFullPath.c_str())) {
+						RomDbg("LoadNVRAM...");
 						LoadNVRAM();
+						RomDbg("LoadNVRAM done");
 					}
 				}
 		}
+		RomDbg("LoadRomFile return 0");
 		return 0;
 	}
 
@@ -1896,6 +1944,7 @@ void refreshScreen() {
 			SET_PAL_OLD,
 			SET_VOLUME,
 			SET_MUTE,
+			SET_ROM_DEBUG,
 			SET_COUNT
 		};
 
@@ -2270,6 +2319,22 @@ void refreshScreen() {
 						}
 						focusEnd(f);
 						scrollIfFocused(f, SET_MUTE);
+
+						f = (wrapperSettingsNav == SET_ROM_DEBUG);
+						focusBegin(f);
+						{
+							bool dbg = EmulatorConfig::romDebug;
+							bool changed = ImGui::Checkbox("ROM load debug", &dbg);
+							if(f && navActivate) {
+								dbg = !dbg;
+								changed = true;
+							}
+							if(changed) {
+								EmulatorConfig::romDebug = dbg;
+							}
+						}
+						focusEnd(f);
+						scrollIfFocused(f, SET_ROM_DEBUG);
 
 						ImGui::PopItemFlag();
 					}
@@ -2793,6 +2858,9 @@ int main(int argC, char* argV[]) {
 #ifdef EMBED_ROM_FILE
 	rom_file_name = EMBED_ROM_FILE;
 #else
+	if(const char* env = getenv("GTE_ROM_DEBUG")) {
+		EmulatorConfig::romDebug = (env[0] != '\0' && strcmp(env, "0") != 0 && strcmp(env, "false") != 0);
+	}
 	for(int argIdx = 1; argIdx < argC; ++argIdx) {
 		if((argV[argIdx])[0] == '-') {
 			EmulatorConfig::parseArg(argV[argIdx]);

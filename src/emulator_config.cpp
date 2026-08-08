@@ -5,6 +5,7 @@
 bool EmulatorConfig::noSound = false;
 bool EmulatorConfig::noJoystick = false;
 bool EmulatorConfig::noSave = false;
+bool EmulatorConfig::romDebug = false;
 Uint32 EmulatorConfig::defaultRendererFlags = SDL_RENDERER_ACCELERATED;
 char *EmulatorConfig::xorFile = NULL;
 
@@ -21,6 +22,16 @@ void EmulatorConfig::parseArg(const char* arg) {
 
     if(strcmp(arg, "--nojoystick") == 0) {
         noJoystick = true;
+        return;
+    }
+
+    if(strcmp(arg, "--rom-debug") == 0) {
+        romDebug = true;
+        return;
+    }
+
+    if(strcmp(arg, "--no-rom-debug") == 0) {
+        romDebug = false;
         return;
     }
 
