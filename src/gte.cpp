@@ -30,22 +30,6 @@
 #include "emulator_config.h"
 #include "game_config.h"
 
-static void RomDbg(const char* msg) {
-	if(!EmulatorConfig::romDebug) return;
-	printf("[rom %u ms] %s\n", (unsigned)SDL_GetTicks(), msg);
-	fflush(stdout);
-}
-
-static void RomDbgf(const char* fmt, ...) {
-	if(!EmulatorConfig::romDebug) return;
-	printf("[rom %u ms] ", (unsigned)SDL_GetTicks());
-	va_list ap;
-	va_start(ap, fmt);
-	vprintf(fmt, ap);
-	va_end(ap);
-	fflush(stdout);
-}
-
 #include "mos6502/mos6502.h"
 
 #include "devtools/memory_map.h"
@@ -79,6 +63,74 @@ static void RomDbgf(const char* fmt, ...) {
 #endif
 #endif
 
+static FILE* romDbgFile = nullptr;
+static std::string romDbgPath;
+
+static void EnsureRomDbgFile() {
+	if(!EmulatorConfig::romDebug || romDbgFile) return;
+
+	std::vector<std::filesystem::path> candidates;
+#ifndef WASM_BUILD
+	const int execPathLength = wai_getExecutablePath(NULL, 0, NULL);
+	if(execPathLength > 0) {
+		char* path = (char*)malloc((size_t)execPathLength + 1);
+		if(path) {
+			wai_getExecutablePath(path, execPathLength, NULL);
+			path[execPathLength] = '\0';
+			candidates.push_back(std::filesystem::path(path).parent_path() / "rom-debug.log");
+			free(path);
+		}
+	}
+#endif
+	if(const char* home = getenv("HOME")) {
+		candidates.push_back(std::filesystem::path(home) / "GameTank-rom-debug.log");
+	}
+	candidates.emplace_back("/tmp/GameTank-rom-debug.log");
+
+	for(const auto& candidate : candidates) {
+		FILE* f = fopen(candidate.string().c_str(), "a");
+		if(!f) continue;
+		romDbgFile = f;
+		romDbgPath = candidate.string();
+		printf("ROM debug log: %s\n", romDbgPath.c_str());
+		fflush(stdout);
+		fprintf(romDbgFile, "----- rom debug session start -----\n");
+		fflush(romDbgFile);
+		return;
+	}
+	printf("ROM debug: could not open a log file (stdout only)\n");
+	fflush(stdout);
+}
+
+static void RomDbgWrite(const char* text) {
+	EnsureRomDbgFile();
+	fputs(text, stdout);
+	fflush(stdout);
+	if(romDbgFile) {
+		fputs(text, romDbgFile);
+		fflush(romDbgFile);
+	}
+}
+
+static void RomDbg(const char* msg) {
+	if(!EmulatorConfig::romDebug) return;
+	char buf[512];
+	snprintf(buf, sizeof(buf), "[rom %u ms] %s\n", (unsigned)SDL_GetTicks(), msg);
+	RomDbgWrite(buf);
+}
+
+static void RomDbgf(const char* fmt, ...) {
+	if(!EmulatorConfig::romDebug) return;
+	char prefix[64];
+	snprintf(prefix, sizeof(prefix), "[rom %u ms] ", (unsigned)SDL_GetTicks());
+	char body[1024];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(body, sizeof(body), fmt, ap);
+	va_end(ap);
+	std::string line = std::string(prefix) + body;
+	RomDbgWrite(line.c_str());
+}
 #ifndef WINDOW_TITLE
 #define WINDOW_TITLE "GameTank Emulator"
 #endif
@@ -2331,6 +2383,7 @@ void refreshScreen() {
 							}
 							if(changed) {
 								EmulatorConfig::romDebug = dbg;
+								if(dbg) EnsureRomDbgFile();
 							}
 						}
 						focusEnd(f);
@@ -2869,6 +2922,10 @@ int main(int argC, char* argV[]) {
 		}
 	}
 #endif
+
+	if(EmulatorConfig::romDebug) {
+		EnsureRomDbgFile();
+	}
 
 #ifdef DEFAULT_ROM_PATH
 	if(argC == 1) {
