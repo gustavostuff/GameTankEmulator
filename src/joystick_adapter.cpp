@@ -218,11 +218,23 @@ void JoystickAdapter::update(SDL_Event *e, bool managementOnly) {
 				//printf("Joystick axis %x %x\n", e->caxis.axis, e->caxis.value);
 			}	
 		} else if(binding.type == BindingTypes::JOYSTICK_BUTTON_SYSTEM) {
-			if(e->type == SDL_CONTROLLERBUTTONDOWN) {
-				if((binding.host_input.joy_button) == (e->cbutton.button)) {
-					systemMenuPressed = true;
-				}
-			}
+			// Menu toggle is hardcoded to Select/Back below; ignore remappable system bindings.
+			continue;
+		}
+	}
+
+	// Menu / panel toggle is always Select (Back) — not remappable
+	if(e->type == SDL_CONTROLLERBUTTONDOWN
+		&& e->cbutton.button == SDL_CONTROLLER_BUTTON_BACK) {
+		systemMenuPressed = true;
+	}
+
+	// L/R shoulders cycle palettes
+	if(e->type == SDL_CONTROLLERBUTTONDOWN) {
+		if(e->cbutton.button == SDL_CONTROLLER_BUTTON_LEFTSHOULDER) {
+			paletteCycleDir = -1;
+		} else if(e->cbutton.button == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) {
+			paletteCycleDir = 1;
 		}
 	}
 }
@@ -237,6 +249,8 @@ void JoystickAdapter::Reset() {
 	pad1Mask = 0;
 	pad2Mask = 0;
 	held1Mask = 0;
+	systemMenuPressed = false;
+	paletteCycleDir = 0;
 	for(int i = 0; i < (BUTTON_COUNT*2); ++i) {
 		button_press_counts[i] = 0;
 	}
@@ -246,6 +260,12 @@ bool JoystickAdapter::CheckSystemButtonPressed() {
 	bool ret = systemMenuPressed;
 	systemMenuPressed = false;
 	return ret;
+}
+
+int JoystickAdapter::CheckPaletteCycle() {
+	int dir = paletteCycleDir;
+	paletteCycleDir = 0;
+	return dir;
 }
 
 void JoystickAdapter::SetPaddleBitsDirect(int val) {

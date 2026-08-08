@@ -105,6 +105,16 @@ else #BSD/Linux
 	COMPILER_FLAGS = `sdl2-config --cflags` $(EXTRA_INCLUDES)
 	OPTIM_FLAGS = -O2
 	LINKER_FLAGS = `sdl2-config --libs`
+
+	ifeq ($(WRAPPERMODE), yes)
+		DEFINES += -D WRAPPER_MODE=1
+		CONSOLE_DISPLAY ?= crt
+		ifeq ($(CONSOLE_DISPLAY), fullscreen)
+			DEFINES += -D CONSOLE_DISPLAY_FULLSCREEN=1
+		else
+			DEFINES += -D CONSOLE_DISPLAY_CRT=1
+		endif
+	endif
 endif
 
 DEFINES += -D CPU_6502_STATIC -D CPU_6502_USE_LOCAL_HEADER -D CMOS_INDIRECT_JMP_FIX
@@ -132,6 +142,9 @@ else ifeq ($(OS), wasm)
 	install -t $(INSTALL_DIR)/bin $(OUT_DIR)/index.wasm
 else #BSD/Linux
 	install $(OUT_DIR)/$(BIN_NAME) $(INSTALL_DIR)/bin
+ifeq ($(WRAPPERMODE), yes)
+	@mkdir -p $(INSTALL_DIR)/bin/roms
+endif
 endif
 
 $(OUT_DIR)/$(ZIP_NAME): bin commit_hash.txt

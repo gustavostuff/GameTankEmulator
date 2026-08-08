@@ -1,110 +1,59 @@
-# GameTank Emulator
+# GameTank Emulator (CRT-friendly, Raspberry Pi / ARM64)
 
-An emulator project for the GameTank 8-bit game console, to speed cross-development of software for the real system.
+Fork of the [upstream GameTank Emulator](https://github.com/clydeshaffer/GameTankEmulator) with a **CRT-friendly**, controller-first WRAPPER UI for **Raspberry Pi / ARM64** (RGB-Pi and similar).
 
-Powered by gianlucag's 6502 emulator library. (Forked to add some WDC 65C02 opcodes)
+Built for low-res CRT output: compact overlay, pixel font, fixed game image scale, and gamepad navigation. Press **Select** to open the menu (ROM list, options, remapping). Menu toggle is always Select.
 
-I mainly develop this on WSL Ubuntu cross-building to Windows, but native Linux and OSX are also supported.
-For setting up the build enviroment I uzed LazyFoo's directions: http://lazyfoo.net/tutorials/SDL/01_hello_SDL/index.php
+## Releases (Raspberry Pi / ARM64)
 
-| ![displaying a whole sprite sheet](img/spritesheet.PNG) | ![a simple platform game scene](img/simplelevel.PNG) |
-|-----------------|--------------------|
+Download a prebuilt package from [Releases](https://github.com/gustavostuff/GameTankEmulator/releases).
 
-## How to use:
-The emulator is meant to test the same ROM files that I'd normally flash to an EEPROM cartridge. You can start the emulator with a ROM file
-either from the command line eg. `./GameTankEmulator.exe conway.gtr` or by dragging the ROM to the executable in Windows Explorer.
+Unpack it so you have:
 
-ROM files should ideally be either 8192 bytes, 32768 bytes, or 2097152 bytes.
-
-| **Type** | **Length**     | **Mapping**                                                                   |
-|----------|----------------|-------------------------------------------------------------------------------|
-| 8K       | 8192           | 0xE000-0xFFFF                                                                 |
-| 32K      | 32768          | 0x8000-0xFFFF                                                                 |
-| 2M       | 2097152        | 0x8000-0xBFFF (movable)<br/> 0xC000-0xFFFF (fixed)                            |
-| UNKNOWN  | Anything else  | End of file aligned with 0xFFFF<br/> Access up to 32K at the end of the file. |
-
-
-
-Gamepad input is emulated (only on port A right now) with the arrow keys, Z, X, C, and Enter.
-
-Other utility keys are:
-
-* Hold F to go Fast (skip SDL_Delay between batches of emulated instructions)
-
-* Press R for soft Reset (set registers to zero, jump execution to the RESET vector, but otherwise memory is left intact)
-
-* Shift+R for HARD reset that randomizes memory and registers, to simulate a cold boot
-
-* Press Esc to exit the program
-
-* Press O to load a rom file at runtime. The dialog also appears if the emulator is launched without specifying a rom file.
-
-* Press F9 to load the profiling window. (Only does anything if the ROM uses the debug hooks)
-
-* Press F10 to open a window that displays some system state info such as the CPU status register or the contents of video/graphics memory.
-
-For Windows users, I've set up an automated [nightly build](https://gametank.zone/emulator/win/latest.php) that contains the latest features... and of course the latest bugs.
-
-_For now I'm listing the differences between the emulator and the real hardware; stopping short of writing a programming manual for the GameTank which will be a separate wiki-like document to come later_
-
-## Build Instructions:
-
-The GameTankEmulator is compiled with [GCC, the GNU Compiler Collection](https://gcc.gnu.org). Please make sure GCC is available on your system.
-
-This project includes some dependencies via [Git Submodules](https://git-scm.com/book/en/v2/Git-Tools-Submodules). To ensure these dependencies are available, either clone with `--recurse-submodules` or run the following commands after cloning:
-
-```sh
-$ git submodule init
-$ git submodule update
+```text
+GameTank/
+  GameTankEmulator
+  roms/
 ```
 
-If when building you receive the error `fatal error: implot.h: No such file or directory`, the is likely due to not correctly pulling in the required Git Submodules.
+1. Put `.gtr` ROMs in `GameTank/roms/`
+2. Place `GameTank/` where you want it (e.g. under your RGB-Pi ports folder) and run `GameTank/GameTankEmulator`
 
-The GameTank Emulator also depends on SDL2. On Linux, X11 development libraries are also required. If you while building you receive errors like `fatal error: SDL2/SDL.h: No such file or directory` or `fatal error: X11/Xlib.h: No such file or directory` please make sure that these libraries are installed.
+## Build on the Pi
 
-Once all dependencies are ready, the GameTank Emulator can be built by using make:
-
-```sh
-$ make install
-```
-
-This should build the GameTank Emulator and install it to `./bin` (the location can be changed with the `$INSTALL_DIR` environment variable). One of the included test roms can then be used to confirm that the GameTank Emulator is functioning as intended:
+SSH into the Pi and paste:
 
 ```sh
-$ ./bin/GameTankEmulator roms/hello.gtr
+curl -fsSL https://raw.githubusercontent.com/gustavostuff/GameTankEmulator/main/scripts/linux/install-rgbpi.sh | bash
 ```
 
-## Emulated Capabilities:
+This clones the repo, builds the ARM64 WRAPPER binary, and writes a `GameTank/` package (under `/media/usb1/roms/ports/` when that path exists, otherwise `~/GameTank`).
 
-### Video:
+Rebuild later:
 
-The graphics board of the GameTank has all its features emulated in a _mostly accurate_ fashion. The emulated graphics can do anything you probably intended to do on the real thing, minus the composite video artifacts.
+```sh
+bash ~/GameTankEmulator/scripts/linux/install-rgbpi.sh
+```
 
-On the graphics board is 32K of framebuffer memory, 32K of "asset" or "sprite" memory, and a handful of control registers for a blitting engine. The rendered image is 128x128 pixels, though a TV cuts off the first and last few rows for an effective resolution of 128x100. Also the column 0 color is used for the border on each row, stretching between the image area and the true edges of the screen.
+## Controls
 
-The DMA controller can be configured for direct CPU access to either page of the framebuffer, either page of the asset memory, or access to the blitting registers. Blitting operations consist of setting the width, height, X and Y within the asset memory, X and Y within the framebuffer for a rectangular area. The blitter will begin copying when its trigger register is written to.
+| Input | Action |
+|-------|--------|
+| Select | Open / close menu |
+| D-pad / stick | Navigate |
+| A | Confirm / Set |
+| B / X | Adjust / Clr (context-dependent) |
+| L / R shoulders | Cycle tabs (in menu) or palettes (in game) |
 
-The blitter can also be used to draw rectangles of solid color, or to skip copying pixels with value 0x00 to treat them as transparent.
+ROMs load from `roms/` next to the binary. Settings and mappings save under the SDL pref path (`…/GameTank/Emulator/`).
 
-### Audio:
+## Desktop build (optional)
 
-Audio is produced by a second 6502 connected to an 8-bit DAC and 4K of dual-port RAM. The main processor can write programs to the Audio RAM from 0x3000 to 0x3FFF, and trigger interrupts on the Audio Processor by writing to certain registers.
+For development on a normal Linux PC (not the Pi CRT target):
 
-The Audio Processor uses a hardware timer to generate interrupts at a consistent rate. The same timing signal is also used to transfer from an intermediate buffer into the DAC. The Audio Processor writes to the intermediate buffer when writing to any address above 0x8000.
-
-Since the intermediate buffer only copies to the DAC when the hardware timer activates, the intermediate buffer may be written to at any time without causing jitter on the DAC output.
-
-### Input:
-
-As mentioned above, a gamepad is emulated with the keyboard keys. (I figured it'd be more convenient to list the key bindings at the top.)
-
-The emulated gamepad is updated during VSync, whereas the real system latches the values from the controller as the register is read.
-
-You can think of the Z, X, C, and Enter as A, B, C, Start on a Sega Genesis controller; which is what I'm testing the physical system with. Eventually I plan to design a custom controller compatible with the same interface.
-### Versatile Interface Adapter (VIA):
-
-In the real system, this is mostly used for setting up IRQ timer interrupts. But it also is wired to a header for a sort of parallel port, as well as another header that could maybe be used for I2C interface to special cartridges.
-
-The VIA timer is not yet implemented, but for 2MB cartridges the SPI pins are emulated to set the position of the movable ROM window. These are on the ORA register.
-
-The ORB register is used to interact with the profiling window in the emulator. (Currently has no physical equivalent)
+```sh
+git clone --recurse-submodules https://github.com/gustavostuff/GameTankEmulator.git
+cd GameTankEmulator
+make WRAPPERMODE=yes CONSOLE_DISPLAY=crt install
+./bin/GameTankEmulator
+```

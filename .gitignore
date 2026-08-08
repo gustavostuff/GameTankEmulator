@@ -1,9 +1,12 @@
 *.o
 *.exe
-bin/*
-build
-build/*
+bin/
+build/
+dist/
+_packages/
 *.dll
 .vscode
 roms/*.sav
-dist
+*.gtr.bak
+.DS_Store
+*~

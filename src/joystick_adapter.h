@@ -62,6 +62,7 @@ private:
 	bool pad1State = false;
 	bool pad2State = false;
 	bool systemMenuPressed = false;
+	int paletteCycleDir = 0;
 	uint16_t pad1Mask = 0;
 	uint16_t pad2Mask = 0;
 	uint16_t held1Mask = 0;
@@ -82,6 +83,9 @@ public:
 	void SaveBindings();
 	void Reset();
 	bool CheckSystemButtonPressed();
+	// -1 = previous palette, +1 = next, 0 = none (edge-triggered)
+	int CheckPaletteCycle();
+	SDL_GameController* GetGameController() const { return gGameController; }
 	void UpdatePaddleFromCursorPos(int player, int mouseX, int windowWidth);
 	void UpdatePaddleFromMouse(int index, int dx);
 	void SetPaddleBitsDirect(int val);

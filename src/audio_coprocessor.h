@@ -28,6 +28,9 @@ typedef struct ACPState {
 	int volume;
 	bool isMuted;
 	bool isEmulationPaused;
+	float outputGain;
+	float hpPrevX;
+	float hpPrevY;
 } ACPState;
 
 class AudioCoprocessor {

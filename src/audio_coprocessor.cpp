@@ -43,39 +43,51 @@ void AudioCoprocessor::register_write(uint16_t address, uint8_t value) {
 
 void AudioCoprocessor::fill_audio(void *udata, uint8_t *stream, int len) {
     ACPState *state = (ACPState*) udata;
-    uint16_t *stream16 = (uint16_t*) stream;
+    int16_t *stream16 = (int16_t*) stream;
+    const int sampleCount = len / (int)sizeof(int16_t);
+    // Short fade; DC is removed by the HPF so this shouldn't thump
+    const float gainStep = 1.0f / 128.0f;
+    const float gainTarget = (state->isMuted || state->isEmulationPaused) ? 0.0f : 1.0f;
+    // ~35Hz one-pole high-pass: fading gain on a DC-biased DAC no longer makes a "bom"
+    const float hpR = 0.995f;
 
-    // If emulation is paused, just fill buffer with zeroes without advancing the apu
-    if (state->isEmulationPaused) {
-	for(int i = 0; i < len/sizeof(uint16_t); i++) {
-	    if(stream16 != NULL) {
-		stream16[i] = 0;
-	    }
-	}
-
-	return;
-    }
-
-    for(int i = 0; i < len/sizeof(uint16_t); i++) {
-        if(stream16 != NULL) {
-            stream16[i] = state->dacReg;
-            stream16[i] -= 128;
-            stream16[i] *= state->volume;
-            stream16[i] *= state->isMuted ? 0 : 1;
+    for(int i = 0; i < sampleCount; i++) {
+        if(state->outputGain < gainTarget) {
+            state->outputGain += gainStep;
+            if(state->outputGain > gainTarget) state->outputGain = gainTarget;
+        } else if(state->outputGain > gainTarget) {
+            state->outputGain -= gainStep;
+            if(state->outputGain < gainTarget) state->outputGain = gainTarget;
         }
-        state->irqCounter -= state->clksPerHostSample;
-        if(state->irqCounter < 0) {
-            if(state->resetting) {
-                state->resetting = false;
-                state->cpu->Reset();
+
+        float x = 0.0f;
+        if(!state->isEmulationPaused) {
+            x = (float)((int32_t)state->dacReg - 128) * (float)state->volume;
+            state->irqCounter -= state->clksPerHostSample;
+            if(state->irqCounter < 0) {
+                if(state->resetting) {
+                    state->resetting = false;
+                    state->cpu->Reset();
+                }
+                state->irqCounter += state->irqRate;
+                state->cycle_counter = 0;
+                if(state->running) {
+                    state->cpu->IRQ();
+                    state->cpu->ClearIRQ();
+                    state->cpu->Run(state->cycles_per_sample, state->cycle_counter);
+                }
             }
-            state->irqCounter += state->irqRate;
-            state->cycle_counter = 0;
-            if(state->running) {
-                state->cpu->IRQ();
-                state->cpu->ClearIRQ();
-                state->cpu->Run(state->cycles_per_sample, state->cycle_counter);
-            }
+        }
+
+        float y = x - state->hpPrevX + hpR * state->hpPrevY;
+        state->hpPrevX = x;
+        state->hpPrevY = y;
+        y *= state->outputGain;
+
+        if(stream16 != NULL) {
+            if(y > 32767.0f) y = 32767.0f;
+            if(y < -32768.0f) y = -32768.0f;
+            stream16[i] = (int16_t)y;
         }
     }
 }
@@ -169,6 +181,9 @@ AudioCoprocessor::AudioCoprocessor() {
     state.volume = 256;
     state.isMuted = false;
     state.isEmulationPaused = true;
+    state.outputGain = 0.0f;
+    state.hpPrevX = 0.0f;
+    state.hpPrevY = 0.0f;
     state.clkMult = 4;
 
 	for(int i = 0; i < AUDIO_RAM_SIZE; i ++) {

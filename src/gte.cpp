@@ -10,6 +10,7 @@
 #include <vector>
 #include <thread>
 #include <algorithm>
+#include <cctype>
 #ifdef WASM_BUILD
 #include "emscripten.h"
 #include <emscripten/html5.h>
@@ -49,6 +50,15 @@
 #include "imgui/backends/imgui_impl_sdl2.h"
 #include "imgui/backends/imgui_impl_sdlrenderer2.h"
 #include "whereami/whereami.h"
+#include "toml/toml.hpp"
+#include "joystick_config.h"
+#include "stb/stb_image.h"
+#ifdef WRAPPER_MODE
+#include "data/proggy_tiny_ttf.h"
+#include "data/list_icon.h"
+#include "data/settings_icon.h"
+#include "data/controller_icon.h"
+#endif
 #endif
 
 #ifndef WINDOW_TITLE
@@ -62,7 +72,13 @@ const int GT_HEIGHT = 128;
 const int VIEWPORT_ASPECT_W = 4;
 const int VIEWPORT_ASPECT_H = 3;
 const int MIN_DISPLAY_SCALE = 2;
+#ifdef WRAPPER_MODE
+int display_scale = 2; // CRT: fixed 1x/2x, default 2x (not fitted to window)
+int imageOffsetX = 0;
+int imageOffsetY = 0;
+#else
 int display_scale = 4;
+#endif
 
 int viewport_width(int scale) {
 	return (GT_HEIGHT * scale * VIEWPORT_ASPECT_W + VIEWPORT_ASPECT_H - 1) / VIEWPORT_ASPECT_H;
@@ -94,6 +110,148 @@ bool vsyncProfileRunning = false;
 
 bool showMenu = false;
 bool menuOpening = false;
+bool pauseWhenMenuOpen = true;
+float menuPanelAlpha = 0.94f;
+bool romLoaded = false;
+#ifdef WRAPPER_MODE
+constexpr int kWrapperTabCount = 3;
+enum { TAB_GAMES = 0, TAB_OPTIONS = 1, TAB_CONTROLLER = 2 };
+
+std::vector<std::filesystem::path> wrapperRomList;
+int wrapperRomListSelected = 0;
+int wrapperForceTab = -1; // tab index, or -1 = none
+int wrapperUiTab = 0;     // last selected tab (persists for input routing)
+int wrapperSettingsNav = 0;
+int wrapperCtrlNav = 0;
+int wrapperCtrlCol = 0; // 0 = Set, 1 = Clr on mapping rows
+bool wrapperRemapListening = false;
+int wrapperRemapTarget = -1; // GameTankButtons::ButtonId, or -2 for Menu/System
+bool wrapperRemapConflict = false;
+SDL_Texture* wrapperTabIconList = nullptr;
+SDL_Texture* wrapperTabIconSettings = nullptr;
+SDL_Texture* wrapperTabIconController = nullptr;
+
+struct WrapperMenuInput {
+	bool tabLeft = false;
+	bool tabRight = false;
+	bool left = false;
+	bool right = false;
+	bool up = false;
+	bool down = false;
+	bool activate = false;
+	bool dec = false;
+	bool inc = false;
+};
+
+static uint32_t wrapperMenuBtnPrev = 0;
+static bool wrapperMenuInputSynced = false;
+static bool wrapperSettingsDirty = false;
+static Uint32 wrapperMenuHeldSince[9] = {};
+static Uint32 wrapperMenuLastRepeat[9] = {};
+std::filesystem::path wrapperPendingRom;
+bool wrapperRomLoadQueued = false;
+
+void SyncWrapperMenuInput() {
+	wrapperMenuInputSynced = false;
+	for(int i = 0; i < 9; ++i) {
+		wrapperMenuHeldSince[i] = 0;
+		wrapperMenuLastRepeat[i] = 0;
+	}
+}
+
+WrapperMenuInput PollWrapperMenuInput() {
+	enum {
+		B_UP = 0, B_DOWN, B_LEFT, B_RIGHT,
+		B_ACTIVATE, B_DEC, B_INC, B_TAB_L, B_TAB_R, B_COUNT
+	};
+	uint32_t cur = 0;
+	auto put = [&](int bit, bool down) {
+		if(down) cur |= (1u << bit);
+	};
+
+	SDL_GameController* gc = joysticks ? joysticks->GetGameController() : nullptr;
+	if(gc) {
+		const Sint16 lx = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX);
+		const Sint16 ly = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY);
+		put(B_UP, SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_UP) || ly < -16000);
+		put(B_DOWN, SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_DOWN) || ly > 16000);
+		put(B_LEFT, SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_LEFT) || lx < -16000);
+		put(B_RIGHT, SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) || lx > 16000);
+		put(B_ACTIVATE, SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_A) != 0);
+		put(B_DEC, SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_X) != 0);
+		put(B_INC, SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_B) != 0);
+		put(B_TAB_L, SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0);
+		put(B_TAB_R, SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) != 0);
+	}
+
+	const Uint8* keys = SDL_GetKeyboardState(nullptr);
+	put(B_UP, keys[SDL_SCANCODE_UP]);
+	put(B_DOWN, keys[SDL_SCANCODE_DOWN]);
+	put(B_LEFT, keys[SDL_SCANCODE_LEFT]);
+	put(B_RIGHT, keys[SDL_SCANCODE_RIGHT]);
+	put(B_ACTIVATE, keys[SDL_SCANCODE_RETURN] || keys[SDL_SCANCODE_KP_ENTER] || keys[SDL_SCANCODE_SPACE]);
+	put(B_DEC, keys[SDL_SCANCODE_MINUS] || keys[SDL_SCANCODE_KP_MINUS]);
+	put(B_INC, keys[SDL_SCANCODE_EQUALS] || keys[SDL_SCANCODE_KP_PLUS]);
+	{
+		const bool shift = keys[SDL_SCANCODE_LSHIFT] || keys[SDL_SCANCODE_RSHIFT];
+		put(B_TAB_L, keys[SDL_SCANCODE_TAB] && shift);
+		put(B_TAB_R, keys[SDL_SCANCODE_TAB] && !shift);
+	}
+
+	WrapperMenuInput out{};
+	if(!wrapperMenuInputSynced) {
+		wrapperMenuBtnPrev = cur;
+		wrapperMenuInputSynced = true;
+		return out;
+	}
+
+	const Uint32 now = SDL_GetTicks();
+	constexpr Uint32 kRepeatDelayMs = 350;
+	constexpr Uint32 kRepeatRateMs = 45;
+	constexpr uint32_t kRepeatMask =
+		(1u << B_UP) | (1u << B_DOWN) | (1u << B_LEFT) | (1u << B_RIGHT) |
+		(1u << B_DEC) | (1u << B_INC);
+
+	auto fired = [&](int bit) -> bool {
+		const uint32_t mask = (1u << bit);
+		const bool down = (cur & mask) != 0;
+		const bool wasDown = (wrapperMenuBtnPrev & mask) != 0;
+		if(down && !wasDown) {
+			wrapperMenuHeldSince[bit] = now;
+			wrapperMenuLastRepeat[bit] = now;
+			return true;
+		}
+		if(!down) {
+			wrapperMenuHeldSince[bit] = 0;
+			wrapperMenuLastRepeat[bit] = 0;
+			return false;
+		}
+		if((kRepeatMask & mask) == 0) {
+			return false;
+		}
+		if(now - wrapperMenuHeldSince[bit] < kRepeatDelayMs) {
+			return false;
+		}
+		if(now - wrapperMenuLastRepeat[bit] < kRepeatRateMs) {
+			return false;
+		}
+		wrapperMenuLastRepeat[bit] = now;
+		return true;
+	};
+
+	out.up = fired(B_UP);
+	out.down = fired(B_DOWN);
+	out.left = fired(B_LEFT);
+	out.right = fired(B_RIGHT);
+	out.activate = fired(B_ACTIVATE);
+	out.dec = fired(B_DEC);
+	out.inc = fired(B_INC);
+	out.tabLeft = fired(B_TAB_L);
+	out.tabRight = fired(B_TAB_R);
+	wrapperMenuBtnPrev = cur;
+	return out;
+}
+#endif
 #define GRID_NONE 0
 #define GRID_25   1
 #define GRID_50   2
@@ -595,6 +753,504 @@ void randomize_vram() {
 	}
 }
 
+void RefreshPaletteBuffers() {
+	if(!vRAM_Surface || !gRAM_Surface) return;
+	for(int i = 0; i < VRAM_BUFFER_SIZE; i ++) {
+		put_pixel32(vRAM_Surface, i & 127, i >> 7, Palette::ConvertColor(vRAM_Surface, system_state.vram[i]));
+	}
+	for(int i = 0; i < GRAM_BUFFER_SIZE; i ++) {
+		put_pixel32(gRAM_Surface, i & 127, i >> 7, Palette::ConvertColor(gRAM_Surface, system_state.gram[i]));
+	}
+}
+
+#ifdef WRAPPER_MODE
+static const int kWrapperPalettes[] = {
+	PALETTE_SELECT_CAPTURE,
+	PALETTE_SELECT_SCALED,
+	PALETTE_SELECT_HDMI,
+	PALETTE_SELECT_OLD,
+};
+static const int kWrapperPaletteCount = 4;
+
+extern "C" int LoadRomFile(const char* filename);
+extern "C" void ResumeEmulation();
+
+void CycleWrapperPalette(int dir) {
+	int idx = 0;
+	for(int i = 0; i < kWrapperPaletteCount; ++i) {
+		if(kWrapperPalettes[i] == palette_select) {
+			idx = i;
+			break;
+		}
+	}
+	idx += (dir >= 0) ? 1 : -1;
+	if(idx < 0) idx = kWrapperPaletteCount - 1;
+	if(idx >= kWrapperPaletteCount) idx = 0;
+	palette_select = kWrapperPalettes[idx];
+	RefreshPaletteBuffers();
+	wrapperSettingsDirty = true;
+}
+
+#ifndef PREFS_TITLE
+#define PREFS_TITLE "Emulator"
+#endif
+
+std::filesystem::path GetWrapperSettingsPath() {
+	char* pref = SDL_GetPrefPath("GameTank", PREFS_TITLE);
+	std::filesystem::path path = pref ? (std::filesystem::path(pref) / "wrapper_settings.toml") : std::filesystem::path("wrapper_settings.toml");
+	if(pref) SDL_free(pref);
+	return path;
+}
+
+void SaveWrapperSettings() {
+	toml::table config;
+	config.emplace("menuPanelAlpha", (double)menuPanelAlpha);
+	config.emplace("pauseWhenMenuOpen", pauseWhenMenuOpen);
+	config.emplace("display_scale", display_scale);
+	config.emplace("imageOffsetX", imageOffsetX);
+	config.emplace("imageOffsetY", imageOffsetY);
+	config.emplace("palette_select", palette_select);
+	config.emplace("wrapperUiTab", wrapperUiTab);
+	if(AudioCoprocessor::singleton_acp_state) {
+		config.emplace("volume", AudioCoprocessor::singleton_acp_state->volume);
+	}
+	config.emplace("mute", (muteMask & MUTE_SOURCE_MANUAL) != 0);
+
+	const std::filesystem::path path = GetWrapperSettingsPath();
+	std::fstream outFile(path, std::ios_base::out | std::ios_base::trunc);
+	if(!outFile) {
+		printf("Failed to save wrapper settings to %s\n", path.c_str());
+		return;
+	}
+	outFile << config << "\n";
+	outFile.close();
+	wrapperSettingsDirty = false;
+	printf("Saved wrapper settings to %s\n", path.c_str());
+}
+
+void LoadWrapperSettings() {
+	const std::filesystem::path path = GetWrapperSettingsPath();
+	if(!std::filesystem::exists(path)) {
+		return;
+	}
+	try {
+		toml::table config = toml::parse_file(path.string());
+		menuPanelAlpha = (float)config["menuPanelAlpha"].value_or((double)menuPanelAlpha);
+		pauseWhenMenuOpen = config["pauseWhenMenuOpen"].value_or(pauseWhenMenuOpen);
+		display_scale = (int)config["display_scale"].value_or(display_scale);
+		if(display_scale < 1) display_scale = 1;
+		if(display_scale > 2) display_scale = 2;
+		imageOffsetX = (int)config["imageOffsetX"].value_or(imageOffsetX);
+		imageOffsetY = (int)config["imageOffsetY"].value_or(imageOffsetY);
+		imageOffsetX = std::clamp(imageOffsetX, -64, 64);
+		imageOffsetY = std::clamp(imageOffsetY, -64, 64);
+		palette_select = (int)config["palette_select"].value_or(palette_select);
+		wrapperUiTab = (int)config["wrapperUiTab"].value_or(wrapperUiTab);
+		wrapperUiTab = std::clamp(wrapperUiTab, 0, kWrapperTabCount - 1);
+		if(AudioCoprocessor::singleton_acp_state) {
+			AudioCoprocessor::singleton_acp_state->volume = (int)config["volume"].value_or(AudioCoprocessor::singleton_acp_state->volume);
+		}
+		bool muted = config["mute"].value_or(false);
+		if(muted) muteMask |= MUTE_SOURCE_MANUAL;
+		else muteMask &= ~MUTE_SOURCE_MANUAL;
+		if(AudioCoprocessor::singleton_acp_state) {
+			AudioCoprocessor::singleton_acp_state->isMuted = (muteMask != 0);
+		}
+		RefreshPaletteBuffers();
+		printf("Loaded wrapper settings from %s\n", path.c_str());
+	} catch(const std::exception& e) {
+		printf("Failed to load wrapper settings: %s\n", e.what());
+	}
+}
+
+void MarkWrapperSettingsDirty() {
+	wrapperSettingsDirty = true;
+}
+
+std::filesystem::path GetExecutableDir() {
+	int execPathLength = wai_getExecutablePath(NULL, 0, NULL);
+	if(execPathLength == -1) {
+		return std::filesystem::current_path();
+	}
+	char* path = (char*)malloc(execPathLength + 1);
+	wai_getExecutablePath(path, execPathLength, NULL);
+	path[execPathLength] = '\0';
+	std::filesystem::path dir = std::filesystem::path(path).parent_path();
+	free(path);
+	return dir;
+}
+
+void RefreshWrapperRomList() {
+	wrapperRomList.clear();
+	std::filesystem::path romsDir = GetExecutableDir() / "roms";
+	if(!std::filesystem::is_directory(romsDir)) {
+		printf("ROMs folder not found: %s\n", romsDir.c_str());
+		return;
+	}
+	for(const auto& entry : std::filesystem::directory_iterator(romsDir)) {
+		if(!entry.is_regular_file()) continue;
+		std::string ext = entry.path().extension().string();
+		for(char& c : ext) c = (char)tolower((unsigned char)c);
+		if(ext == ".gtr") {
+			wrapperRomList.push_back(entry.path());
+		}
+	}
+	std::sort(wrapperRomList.begin(), wrapperRomList.end(),
+		[](const std::filesystem::path& a, const std::filesystem::path& b) {
+			return a.filename().string() < b.filename().string();
+		});
+	if(wrapperRomListSelected >= (int)wrapperRomList.size()) {
+		wrapperRomListSelected = 0;
+	}
+	printf("Found %zu ROM(s) in %s\n", wrapperRomList.size(), romsDir.c_str());
+}
+
+bool OpenWrapperRom(const std::filesystem::path& path) {
+	const std::string pathStr = path.string();
+	printf("Opening ROM: %s\n", pathStr.c_str());
+	if(LoadRomFile(pathStr.c_str()) != 0) {
+		printf("Failed to load ROM: %s\n", pathStr.c_str());
+		return false;
+	}
+	romLoaded = true;
+	showMenu = false;
+	SyncWrapperMenuInput();
+	cpu_core->Reset();
+	cartridge_state.write_mode = false;
+	joysticks->Reset();
+	ResumeEmulation();
+	return true;
+}
+
+void QueueWrapperRomOpen(const std::filesystem::path& path) {
+	wrapperPendingRom = path;
+	wrapperRomLoadQueued = true;
+	showMenu = false;
+	SyncWrapperMenuInput();
+}
+
+void ProcessQueuedWrapperRomOpen() {
+	if(!wrapperRomLoadQueued) return;
+	wrapperRomLoadQueued = false;
+	const std::filesystem::path path = wrapperPendingRom;
+	wrapperPendingRom.clear();
+	if(!OpenWrapperRom(path)) {
+		showMenu = true;
+		menuOpening = true;
+		wrapperForceTab = TAB_GAMES;
+	}
+}
+
+SDL_Texture* LoadWrapperPngTextureFromMemory(const unsigned char* data, unsigned int len) {
+	int width = 0, height = 0, channels = 0;
+	unsigned char* imgData = stbi_load_from_memory(data, (int)len, &width, &height, &channels, 4);
+	if(!imgData) {
+		printf("Failed to decode embedded icon\n");
+		return nullptr;
+	}
+	SDL_Surface* surface = SDL_CreateRGBSurfaceWithFormatFrom(
+		imgData, width, height, 32, width * 4, SDL_PIXELFORMAT_RGBA32);
+	SDL_Texture* tex = nullptr;
+	if(surface) {
+		tex = SDL_CreateTextureFromSurface(mainRenderer, surface);
+		SDL_SetTextureScaleMode(tex, SDL_ScaleModeNearest);
+		SDL_FreeSurface(surface);
+	}
+	stbi_image_free(imgData);
+	return tex;
+}
+
+void LoadWrapperTabIcons() {
+	if(!wrapperTabIconList) {
+		wrapperTabIconList = LoadWrapperPngTextureFromMemory(img_list_icon_png, img_list_icon_png_len);
+	}
+	if(!wrapperTabIconSettings) {
+		wrapperTabIconSettings = LoadWrapperPngTextureFromMemory(img_settings_icon_png, img_settings_icon_png_len);
+	}
+	if(!wrapperTabIconController) {
+		wrapperTabIconController = LoadWrapperPngTextureFromMemory(img_controller_icon_png, img_controller_icon_png_len);
+	}
+}
+
+void CancelWrapperRemap() {
+	wrapperRemapListening = false;
+	wrapperRemapTarget = -1;
+	wrapperRemapConflict = false;
+}
+
+const char* GtButtonLabel(int buttonId) {
+	switch(buttonId) {
+		case GameTankButtons::P1_UP: return "Up";
+		case GameTankButtons::P1_DOWN: return "Down";
+		case GameTankButtons::P1_LEFT: return "Left";
+		case GameTankButtons::P1_RIGHT: return "Right";
+		case GameTankButtons::P1_A: return "A";
+		case GameTankButtons::P1_B: return "B";
+		case GameTankButtons::P1_C: return "C";
+		case GameTankButtons::P1_START: return "Start";
+		default: return "?";
+	}
+}
+
+const char* JoyButtonLabel(uint8_t button) {
+	switch(button) {
+		case SDL_CONTROLLER_BUTTON_A: return "A";
+		case SDL_CONTROLLER_BUTTON_B: return "B";
+		case SDL_CONTROLLER_BUTTON_X: return "X";
+		case SDL_CONTROLLER_BUTTON_Y: return "Y";
+		case SDL_CONTROLLER_BUTTON_BACK: return "Select";
+		case SDL_CONTROLLER_BUTTON_GUIDE: return "Guide";
+		case SDL_CONTROLLER_BUTTON_START: return "Start";
+		case SDL_CONTROLLER_BUTTON_LEFTSTICK: return "L3";
+		case SDL_CONTROLLER_BUTTON_RIGHTSTICK: return "R3";
+		case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: return "LB";
+		case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: return "RB";
+		case SDL_CONTROLLER_BUTTON_DPAD_UP: return "D-Up";
+		case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return "D-Down";
+		case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return "D-Left";
+		case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return "D-Right";
+		default: return "Btn";
+	}
+}
+
+const char* JoyAxisLabel(uint8_t axis) {
+	switch(axis) {
+		case SDL_CONTROLLER_AXIS_LEFTX: return "LX";
+		case SDL_CONTROLLER_AXIS_LEFTY: return "LY";
+		case SDL_CONTROLLER_AXIS_RIGHTX: return "RX";
+		case SDL_CONTROLLER_AXIS_RIGHTY: return "RY";
+		case SDL_CONTROLLER_AXIS_TRIGGERLEFT: return "LT";
+		case SDL_CONTROLLER_AXIS_TRIGGERRIGHT: return "RT";
+		default: return "Axis";
+	}
+}
+
+std::string FormatInputBinding(const InputBinding& bind) {
+	char buf[48];
+	switch(bind.type) {
+		case BindingTypes::KEYBOARD:
+			snprintf(buf, sizeof(buf), "Key %s", SDL_GetKeyName(bind.host_input.key));
+			return buf;
+		case BindingTypes::JOYSTICK_BUTTON:
+		case BindingTypes::JOYSTICK_BUTTON_SYSTEM:
+			return JoyButtonLabel(bind.host_input.joy_button);
+		case BindingTypes::JOYSTICK_AXIS:
+			snprintf(buf, sizeof(buf), "%s%s", JoyAxisLabel(bind.host_input.axis.axis),
+				bind.host_input.axis.negative ? "-" : "+");
+			return buf;
+		case BindingTypes::JOYSTICK_HAT:
+			return "Hat";
+		default:
+			return "?";
+	}
+}
+
+int BindingRank(BindingTypes::BindingType type) {
+	switch(type) {
+		case BindingTypes::JOYSTICK_BUTTON:
+		case BindingTypes::JOYSTICK_BUTTON_SYSTEM:
+			return 3;
+		case BindingTypes::JOYSTICK_AXIS:
+			return 2;
+		case BindingTypes::JOYSTICK_HAT:
+			return 1;
+		case BindingTypes::KEYBOARD:
+			return 0;
+		default:
+			return -1;
+	}
+}
+
+// Prefer joystick binding text for display; falls back to keyboard.
+std::string BindingTextForButton(GameTankButtons::ButtonId buttonId) {
+	int bestIdx = -1;
+	int bestRank = -1;
+	for(int i = 0; i < (int)joysticks->bindings.size(); ++i) {
+		const InputBinding& b = joysticks->bindings[i];
+		if(b.type == BindingTypes::JOYSTICK_BUTTON_SYSTEM) continue;
+		if(b.button != buttonId) continue;
+		const int rank = BindingRank(b.type);
+		if(rank > bestRank) {
+			bestRank = rank;
+			bestIdx = i;
+		}
+	}
+	if(bestIdx < 0) return "-";
+	return FormatInputBinding(joysticks->bindings[bestIdx]);
+}
+
+std::string BindingTextForSystem() {
+	for(const InputBinding& b : joysticks->bindings) {
+		if(b.type == BindingTypes::JOYSTICK_BUTTON_SYSTEM) {
+			return FormatInputBinding(b);
+		}
+	}
+	return "-";
+}
+
+void ClearBindingsForButton(GameTankButtons::ButtonId buttonId) {
+	auto& binds = joysticks->bindings;
+	binds.erase(std::remove_if(binds.begin(), binds.end(),
+		[buttonId](const InputBinding& b) {
+			if(b.type == BindingTypes::JOYSTICK_BUTTON_SYSTEM) return false;
+			return b.button == buttonId;
+		}), binds.end());
+	joysticks->SaveBindings();
+}
+
+void ClearSystemBinding() {
+	auto& binds = joysticks->bindings;
+	binds.erase(std::remove_if(binds.begin(), binds.end(),
+		[](const InputBinding& b) {
+			return b.type == BindingTypes::JOYSTICK_BUTTON_SYSTEM;
+		}), binds.end());
+	joysticks->SaveBindings();
+}
+
+bool HostInputsMatch(const InputBinding& a, const InputBinding& b) {
+	const bool aPadBtn =
+		a.type == BindingTypes::JOYSTICK_BUTTON ||
+		a.type == BindingTypes::JOYSTICK_BUTTON_SYSTEM;
+	const bool bPadBtn =
+		b.type == BindingTypes::JOYSTICK_BUTTON ||
+		b.type == BindingTypes::JOYSTICK_BUTTON_SYSTEM;
+	if(aPadBtn && bPadBtn) {
+		return a.host_input.joy_button == b.host_input.joy_button;
+	}
+	if(a.type != b.type) {
+		return false;
+	}
+	switch(a.type) {
+		case BindingTypes::KEYBOARD:
+			return a.host_input.key == b.host_input.key;
+		case BindingTypes::JOYSTICK_AXIS:
+			return a.host_input.axis.axis == b.host_input.axis.axis
+				&& a.host_input.axis.negative == b.host_input.axis.negative;
+		case BindingTypes::JOYSTICK_HAT:
+			return a.host_input.joy_button == b.host_input.joy_button;
+		default:
+			return false;
+	}
+}
+
+// True if this host input is already bound to a different GameTank action.
+bool IsHostInputAlreadyMapped(const InputBinding& incoming) {
+	for(const InputBinding& b : joysticks->bindings) {
+		if(wrapperRemapTarget == -2) {
+			if(b.type == BindingTypes::JOYSTICK_BUTTON_SYSTEM) continue;
+		} else if(wrapperRemapTarget >= 0) {
+			if(b.type != BindingTypes::JOYSTICK_BUTTON_SYSTEM
+				&& b.button == (GameTankButtons::ButtonId)wrapperRemapTarget) {
+				continue;
+			}
+		}
+		if(HostInputsMatch(incoming, b)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void ApplyCapturedBinding(const InputBinding& incoming) {
+	if(wrapperRemapTarget == -2) {
+		ClearSystemBinding();
+		InputBinding b = incoming;
+		b.type = BindingTypes::JOYSTICK_BUTTON_SYSTEM;
+		b.button = GameTankButtons::NO_BUTTON;
+		joysticks->bindings.push_back(b);
+	} else if(wrapperRemapTarget >= 0) {
+		const auto buttonId = (GameTankButtons::ButtonId)wrapperRemapTarget;
+		// Replace host bindings of the same class; keep other classes (e.g. keep keys when setting pad)
+		auto& binds = joysticks->bindings;
+		binds.erase(std::remove_if(binds.begin(), binds.end(),
+			[&](const InputBinding& b) {
+				if(b.type == BindingTypes::JOYSTICK_BUTTON_SYSTEM) return false;
+				if(b.button != buttonId) return false;
+				if(incoming.type == BindingTypes::KEYBOARD) {
+					return b.type == BindingTypes::KEYBOARD;
+				}
+				return b.type == BindingTypes::JOYSTICK_BUTTON
+					|| b.type == BindingTypes::JOYSTICK_AXIS
+					|| b.type == BindingTypes::JOYSTICK_HAT;
+			}), binds.end());
+		InputBinding b = incoming;
+		b.button = buttonId;
+		joysticks->bindings.push_back(b);
+	}
+	joysticks->SaveBindings();
+	CancelWrapperRemap();
+}
+
+bool TryCaptureWrapperRemap(const SDL_Event& e) {
+	if(!wrapperRemapListening) return false;
+
+	InputBinding captured{};
+	bool got = false;
+
+	if(e.type == SDL_KEYDOWN && e.key.repeat == 0) {
+		if(e.key.keysym.sym == SDLK_ESCAPE) {
+			CancelWrapperRemap();
+			wrapperRemapConflict = false;
+			return true;
+		}
+		captured.type = BindingTypes::KEYBOARD;
+		captured.host_input.key = e.key.keysym.sym;
+		got = true;
+	} else if(e.type == SDL_CONTROLLERBUTTONDOWN) {
+		// Select cancels remap unless we're binding the Menu action itself
+		if(e.cbutton.button == SDL_CONTROLLER_BUTTON_BACK && wrapperRemapTarget != -2) {
+			CancelWrapperRemap();
+			wrapperRemapConflict = false;
+			SyncWrapperMenuInput();
+			return true;
+		}
+		captured.type = BindingTypes::JOYSTICK_BUTTON;
+		captured.host_input.joy_button = e.cbutton.button;
+		got = true;
+	} else if(e.type == SDL_CONTROLLERAXISMOTION) {
+		if(e.caxis.value > 16384 || e.caxis.value < -16384) {
+			captured.type = BindingTypes::JOYSTICK_AXIS;
+			captured.host_input.axis.axis = e.caxis.axis;
+			captured.host_input.axis.negative = e.caxis.value < 0;
+			got = true;
+		}
+	}
+
+	if(got) {
+		// Select/Back is reserved for the menu toggle
+		if(captured.type == BindingTypes::JOYSTICK_BUTTON
+			&& captured.host_input.joy_button == SDL_CONTROLLER_BUTTON_BACK) {
+			wrapperRemapConflict = true;
+			return true;
+		}
+		if(IsHostInputAlreadyMapped(captured)) {
+			wrapperRemapConflict = true;
+			return true; // consume input, keep listening
+		}
+		wrapperRemapConflict = false;
+		ApplyCapturedBinding(captured);
+		SyncWrapperMenuInput();
+		return true;
+	}
+	return false;
+}
+
+void ResetWrapperControllerBindings() {
+	joysticks->bindings.clear();
+	load_joystick_defaults(joysticks->bindings);
+	joysticks->SaveBindings();
+	joysticks->Reset();
+	CancelWrapperRemap();
+}
+
+const char* WrapperControllerName() {
+	SDL_GameController* gc = joysticks ? joysticks->GetGameController() : nullptr;
+	if(!gc) return "(no controller)";
+	const char* name = SDL_GameControllerName(gc);
+	return name ? name : "(controller)";
+}
+#endif
+
 void randomize_memory() {
 	for(int i = 0; i < RAMSIZE; i++) {
 		system_state.ram[i] = rand() % 256;
@@ -707,8 +1363,14 @@ extern "C" {
 		}
 
 		fseek(romFileP, 0L, SEEK_END);
-		cartridge_state.size = ftell(romFileP);
-		//cartridge_state.rom = new uint8_t [cartridge_state.size];
+		long fileSize = ftell(romFileP);
+		constexpr long kMaxRomBytes = 1L << 21; // 2MB cartridge buffer
+		if(fileSize <= 0 || fileSize > kMaxRomBytes) {
+			printf("Invalid ROM size: %ld bytes (max %ld)\n", fileSize, kMaxRomBytes);
+			fclose(romFileP);
+			return -1;
+		}
+		cartridge_state.size = (int)fileSize;
 		cartridge_state.write_mode = false;
 		rewind(romFileP);
 		switch(cartridge_state.size) {
@@ -729,8 +1391,12 @@ extern "C" {
 			printf("Unknown ROM type: Size is %d bytes\n", cartridge_state.size);
 			break;
 		}
-		fread(cartridge_state.rom, sizeof(uint8_t), cartridge_state.size, romFileP);
+		const size_t got = fread(cartridge_state.rom, sizeof(uint8_t), (size_t)cartridge_state.size, romFileP);
 		fclose(romFileP);
+		if(got != (size_t)cartridge_state.size) {
+			printf("Short ROM read: got %zu of %d bytes\n", got, cartridge_state.size);
+			return -1;
+		}
 		if(cpu_core) {
 			ResumeEmulation();
 			cpu_core->Reset();
@@ -899,6 +1565,9 @@ void toggleControllerOptionsWindow() {
 #endif
 
 void toggleFullScreen() {
+#if defined(WRAPPER_MODE) && !defined(CONSOLE_DISPLAY_FULLSCREEN)
+	return;
+#else
 	if(isFullScreen) {
 		SDL_SetWindowFullscreen(mainWindow, 0);
 		isFullScreen = false;
@@ -907,11 +1576,15 @@ void toggleFullScreen() {
 		isFullScreen = true;
 	}
 	timekeeper.scaling_increment = INITIAL_SCALING_INCREMENT;
+#endif
 }
 
 void toggleMute() {
 	muteMask = muteMask ^ MUTE_SOURCE_MANUAL;
-	AudioCoprocessor::singleton_acp_state->isMuted = (muteMask != 0);
+	ACPState* acp = AudioCoprocessor::singleton_acp_state;
+	if(acp->device) SDL_LockAudioDevice(acp->device);
+	acp->isMuted = (muteMask != 0);
+	if(acp->device) SDL_UnlockAudioDevice(acp->device);
 }
 
 void setMenuMute(bool muted) {
@@ -919,7 +1592,10 @@ void setMenuMute(bool muted) {
 	if(muted) {
 		muteMask |= MUTE_SOURCE_MENU;
 	}
-	AudioCoprocessor::singleton_acp_state->isMuted = (muteMask != 0);
+	ACPState* acp = AudioCoprocessor::singleton_acp_state;
+	if(acp->device) SDL_LockAudioDevice(acp->device);
+	acp->isMuted = (muteMask != 0);
+	if(acp->device) SDL_UnlockAudioDevice(acp->device);
 }
 
 typedef struct HotkeyAssignment {
@@ -962,14 +1638,25 @@ void refreshScreen() {
 	src.w = GT_WIDTH;
 	src.h = GT_HEIGHT;
 	SDL_GetWindowSize(mainWindow, &scr_w, &scr_h);
+#ifdef WRAPPER_MODE
+	// CRT/console: always use the user scale (1x or 2x), never downscale to fit.
+	int scale = display_scale;
+	if(scale < 1) scale = 1;
+	if(scale > 2) scale = 2;
+#else
 	int scale_h = scr_h / GT_HEIGHT;
 	int scale_w = (scr_w * VIEWPORT_ASPECT_H) / (GT_HEIGHT * VIEWPORT_ASPECT_W);
 	int scale = min(scale_h, scale_w);
 	if(scale < MIN_DISPLAY_SCALE) scale = MIN_DISPLAY_SCALE;
+#endif
 	viewport_dest.w = viewport_width(scale);
 	viewport_dest.h = viewport_height(scale);
 	viewport_dest.x = (scr_w - viewport_dest.w) / 2;
 	viewport_dest.y = (scr_h - viewport_dest.h) / 2;
+#ifdef WRAPPER_MODE
+	viewport_dest.x += imageOffsetX;
+	viewport_dest.y += imageOffsetY;
+#endif
 	dest.w = GT_WIDTH * scale;
 	dest.h = GT_HEIGHT * scale;
 	dest.x = viewport_dest.x + (viewport_dest.w - dest.w) / 2;
@@ -979,7 +1666,7 @@ void refreshScreen() {
 	SDL_RenderClear(mainRenderer);
 	SDL_RenderCopy(mainRenderer, framebufferTexture, &src, &dest);
 
-	if(grid_mode != GRID_NONE && scale >= MIN_DISPLAY_SCALE) {
+	if(grid_mode != GRID_NONE && scale >= 1) {
 		static const Uint8 grid_alphas[] = { 0, 64, 128, 255 };
 		rebuildGridOverlay(scale);
 		SDL_SetTextureAlphaMod(gridOverlayTexture, grid_alphas[grid_mode]);
@@ -998,7 +1685,7 @@ void refreshScreen() {
 
 	SDL_RenderCopy(mainRenderer, framebufferTexture, &src, &dest);
 
-	if(grid_mode != GRID_NONE && scale >= MIN_DISPLAY_SCALE) {
+	if(grid_mode != GRID_NONE && scale >= 1) {
 		static const Uint8 grid_alphas[] = { 0, 64, 128, 255 };
 		src.x = 0;
 		src.y = 0;
@@ -1014,6 +1701,17 @@ void refreshScreen() {
 
 #if !defined(WASM_BUILD)
 	ImGui::SetCurrentContext(main_imgui_ctx);
+#ifdef WRAPPER_MODE
+	{
+		// Menu owns all directional input; suppress ImGui nav so tabs/sliders don't fight us.
+		ImGuiIO& io_nav = ImGui::GetIO();
+		if(showMenu) {
+			io_nav.ConfigFlags &= ~(ImGuiConfigFlags_NavEnableGamepad | ImGuiConfigFlags_NavEnableKeyboard);
+		} else {
+			io_nav.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad | ImGuiConfigFlags_NavEnableKeyboard;
+		}
+	}
+#endif
     ImGui_ImplSDLRenderer2_NewFrame();
     ImGui_ImplSDL2_NewFrame();
 	ImGui::NewFrame();
@@ -1104,66 +1802,573 @@ void refreshScreen() {
 		ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-		ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0.5f)); // 50% transparent black
+		ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0.5f));
 		ImGui::Begin("OverlayBackground", nullptr,
 			ImGuiWindowFlags_NoDecoration |
-			ImGuiWindowFlags_NoInputs | 
+			ImGuiWindowFlags_NoInputs |
 			ImGuiWindowFlags_NoMove |
 			ImGuiWindowFlags_NoBringToFrontOnFocus);
 		ImGui::End();
 		ImGui::PopStyleColor();
 		ImGui::PopStyleVar(2);
 
-		// Now create the actual menu window in the top-left corner
-		ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Always);
-		ImGui::SetNextWindowBgAlpha(0.9f);
+		ImGuiIO& io = ImGui::GetIO();
+		const float panel_w = (io.DisplaySize.x < 266.0f) ? io.DisplaySize.x - 16.0f : 250.0f;
+		const float panel_h = (io.DisplaySize.y < 196.0f) ? io.DisplaySize.y - 16.0f : 180.0f;
+		ImGui::SetNextWindowPos(ImVec2((io.DisplaySize.x - panel_w) * 0.5f, (io.DisplaySize.y - panel_h) * 0.5f), ImGuiCond_Always);
+		ImGui::SetNextWindowSize(ImVec2(panel_w, panel_h), ImGuiCond_Always);
+		ImGui::SetNextWindowBgAlpha(menuPanelAlpha);
 		if(!ImGui::IsAnyItemFocused()) {
 			ImGui::SetNextWindowFocus();
 		}
-		menuOpening = false;
-		ImGui::Begin("MainMenu", nullptr,
-			ImGuiWindowFlags_AlwaysAutoResize |
+
+		// Compact controls sized for 10px Proggy Tiny
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, 6));
+		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6, 3));
+		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4, 2));
+		ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 10.0f);
+
+		ImGui::Begin("MainPanel", nullptr,
 			ImGuiWindowFlags_NoCollapse |
+			ImGuiWindowFlags_NoResize |
 			ImGuiWindowFlags_NoMove |
 			ImGuiWindowFlags_NoSavedSettings |
 			ImGuiWindowFlags_NoTitleBar);
 
-			ImGui::SetWindowFontScale(2.0f);
-
-		if (ImGui::IsWindowAppearing())
-    		ImGui::SetKeyboardFocusHere(-1);
-		
-
-		if (ImGui::BeginMenu("Options")) {
-			// These are items inside the pop-out menu
-			if (ImGui::MenuItem("Toggle Full Screen")) {
-				toggleFullScreen();
+		const bool panelJustOpened = ImGui::IsWindowAppearing() || menuOpening;
+		if (panelJustOpened) {
+			if(wrapperForceTab < 0) {
+				wrapperForceTab = wrapperUiTab; // restore last tab
 			}
-			ImGui::SliderInt("Volume", &AudioCoprocessor::singleton_acp_state->volume, 0, 256, "", ImGuiSliderFlags_NoInput);
-			bool appMute = (muteMask & MUTE_SOURCE_MANUAL) != 0;
-			ImGui::Checkbox("Mute Audio", &appMute);
-			if(appMute) muteMask |= MUTE_SOURCE_MANUAL;
-			else muteMask &= ~MUTE_SOURCE_MANUAL;
-			AudioCoprocessor::singleton_acp_state->isMuted = (muteMask != 0);
-			ImGui::Separator();
-			if (ImGui::Checkbox("Enable Paddle Emulation", &paddle_emulation_enabled)) {
-				joysticks->SetHeldButtons(0);//clear bits on change just in case
+			if(wrapperForceTab == TAB_GAMES) {
+				RefreshWrapperRomList();
 			}
-			ImGui::EndMenu();
+			wrapperSettingsNav = 0;
+			wrapperCtrlNav = 0;
+			wrapperCtrlCol = 0;
+			CancelWrapperRemap();
+			SyncWrapperMenuInput();
+		}
+		menuOpening = false;
+
+		static int lastSettingsScroll = -1;
+		static int lastCtrlScroll = -1;
+		if(panelJustOpened) {
+			lastSettingsScroll = -1;
+			lastCtrlScroll = -1;
 		}
 
-		if(ImGui::Selectable("Reset")) {
-			resetQueued = 2;
-			showMenu = false;
-			setMenuMute(showMenu);
-			joysticks->Reset();
+		enum {
+			SET_QUIT = 0,
+			SET_RESET_GAME,
+			SET_OPACITY,
+			SET_PAUSE,
+			SET_SCALE_1X,
+			SET_SCALE_2X,
+			SET_OFF_X,
+			SET_OFF_Y,
+			SET_PAL_CAPTURE,
+			SET_PAL_SCALED,
+			SET_PAL_HDMI,
+			SET_PAL_OLD,
+			SET_VOLUME,
+			SET_MUTE,
+			SET_COUNT
+		};
+
+		enum {
+			CTRL_UP = 0,
+			CTRL_DOWN,
+			CTRL_LEFT,
+			CTRL_RIGHT,
+			CTRL_A,
+			CTRL_B,
+			CTRL_C,
+			CTRL_START,
+			CTRL_RESET_ALL,
+			CTRL_COUNT
+		};
+
+		// SDL edge-detect input (avoids ImGui missing A when it was held across menu open)
+		const WrapperMenuInput menuIn = PollWrapperMenuInput();
+		if(!wrapperRemapListening) {
+			if(menuIn.tabLeft) {
+				wrapperForceTab = (wrapperUiTab + kWrapperTabCount - 1) % kWrapperTabCount;
+			}
+			if(menuIn.tabRight) {
+				wrapperForceTab = (wrapperUiTab + 1) % kWrapperTabCount;
+			}
+		}
+		const bool onHSlider =
+			(wrapperUiTab == TAB_OPTIONS) && (
+				wrapperSettingsNav == SET_OPACITY ||
+				wrapperSettingsNav == SET_OFF_X ||
+				wrapperSettingsNav == SET_OFF_Y ||
+				wrapperSettingsNav == SET_VOLUME);
+		const bool onCtrlMapRow =
+			(wrapperUiTab == TAB_CONTROLLER) && (wrapperCtrlNav < CTRL_RESET_ALL);
+		// Shoulders / Tab (Shift+Tab) switch tabs. Arrow keys adjust sliders / Set·Clr only.
+		const bool navUp = !wrapperRemapListening && menuIn.up;
+		const bool navDown = !wrapperRemapListening && menuIn.down;
+		const bool navActivate = !wrapperRemapListening && menuIn.activate;
+		const bool navDec = !wrapperRemapListening && (menuIn.dec || (onHSlider && menuIn.left) || (onCtrlMapRow && menuIn.left));
+		const bool navInc = !wrapperRemapListening && (menuIn.inc || (onHSlider && menuIn.right) || (onCtrlMapRow && menuIn.right));
+
+		if(wrapperForceTab >= 0) {
+			wrapperUiTab = wrapperForceTab;
+			wrapperForceTab = -1;
+			CancelWrapperRemap();
+			if(wrapperUiTab == TAB_GAMES) {
+				RefreshWrapperRomList();
+			}
+			lastSettingsScroll = -1;
+			lastCtrlScroll = -1;
 		}
 
-		if(ImGui::Selectable("Exit")) {
-			running = false;
+		auto focusBegin = [](bool on) {
+			if(on) {
+				ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 0.0f, 1.0f));
+			} else {
+				// 60% transparent when not selected
+				ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 0.4f));
+			}
+		};
+		auto focusEnd = [](bool) {
+			ImGui::PopStyleColor(1);
+		};
+
+		// Icon tab bar — rounded tops, active tab merges into panel (RGB-Pi style)
+		{
+			SDL_Texture* icons[kWrapperTabCount] = {
+				wrapperTabIconList, wrapperTabIconSettings, wrapperTabIconController
+			};
+			constexpr float kTabW = 28.0f;
+			constexpr float kTabH = 20.0f;
+			constexpr float kTabGap = 3.0f;
+			constexpr float kTabRound = 4.0f;
+			const ImU32 idleCol = IM_COL32(45, 95, 175, 255);
+			const ImU32 selCol = IM_COL32(70, 145, 230, 255);
+			const ImU32 lineCol = IM_COL32(70, 145, 230, 255);
+			ImDrawList* dl = ImGui::GetWindowDrawList();
+			const ImVec2 rowStart = ImGui::GetCursorScreenPos();
+			const float rowWidth = ImGui::GetContentRegionAvail().x;
+
+			for(int i = 0; i < kWrapperTabCount; ++i) {
+				if(i > 0) ImGui::SameLine(0.0f, kTabGap);
+				ImGui::PushID(i);
+				const bool sel = (wrapperUiTab == i);
+				const ImVec2 p0 = ImGui::GetCursorScreenPos();
+				const ImVec2 p1(p0.x + kTabW, p0.y + kTabH);
+				dl->AddRectFilled(p0, p1, sel ? selCol : idleCol, kTabRound, ImDrawFlags_RoundCornersTop);
+				if(icons[i]) {
+					constexpr float kIcon = 16.0f;
+					const float ix = p0.x + (kTabW - kIcon) * 0.5f;
+					const float iy = p0.y + (kTabH - kIcon) * 0.5f;
+					dl->AddImage(
+						ImTextureRef((ImTextureID)(intptr_t)icons[i]),
+						ImVec2(ix, iy),
+						ImVec2(ix + kIcon, iy + kIcon),
+						ImVec2(0, 0), ImVec2(1, 1),
+						IM_COL32(255, 255, 255, 255));
+				}
+				if(ImGui::InvisibleButton("##tab", ImVec2(kTabW, kTabH))) {
+					wrapperForceTab = i;
+				}
+				ImGui::PopID();
+			}
+
+			// Base line under tabs; active tab punches a gap so it merges with content
+			const float lineY = rowStart.y + kTabH;
+			float lineX = rowStart.x;
+			const float lineEnd = rowStart.x + rowWidth;
+			for(int i = 0; i < kWrapperTabCount; ++i) {
+				const float tabX0 = rowStart.x + i * (kTabW + kTabGap);
+				const float tabX1 = tabX0 + kTabW;
+				if(i == wrapperUiTab) {
+					if(lineX < tabX0) {
+						dl->AddLine(ImVec2(lineX, lineY), ImVec2(tabX0, lineY), lineCol, 1.0f);
+					}
+					lineX = tabX1;
+				}
+			}
+			if(lineX < lineEnd) {
+				dl->AddLine(ImVec2(lineX, lineY), ImVec2(lineEnd, lineY), lineCol, 1.0f);
+			}
+			ImGui::SetCursorScreenPos(ImVec2(rowStart.x, lineY + 4.0f));
+			ImGui::Dummy(ImVec2(rowWidth, 0.0f));
+
+			if(wrapperForceTab >= 0) {
+				wrapperUiTab = wrapperForceTab;
+				wrapperForceTab = -1;
+				CancelWrapperRemap();
+				if(wrapperUiTab == TAB_GAMES) {
+					RefreshWrapperRomList();
+				}
+				lastSettingsScroll = -1;
+				lastCtrlScroll = -1;
+			}
 		}
+
+		if (ImGui::BeginChild("PanelBody", ImVec2(0, 0), ImGuiChildFlags_None)) {
+			if (wrapperUiTab == TAB_GAMES) {
+					if(wrapperRomList.empty()) {
+						ImGui::TextWrapped("No .gtr files in roms/");
+						if(ImGui::Button("Refresh")) {
+							RefreshWrapperRomList();
+						}
+					} else {
+						bool activateRom = false;
+						if(navDown && wrapperRomListSelected + 1 < (int)wrapperRomList.size()) {
+							++wrapperRomListSelected;
+						}
+						if(navUp && wrapperRomListSelected > 0) {
+							--wrapperRomListSelected;
+						}
+						if(navActivate) {
+							activateRom = true;
+						}
+
+						if(ImGui::BeginChild("RomList", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_NoNav)) {
+							static int lastScrolledRom = -1;
+							ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+							for(int i = 0; i < (int)wrapperRomList.size(); ++i) {
+								const bool selected = (i == wrapperRomListSelected);
+								std::string label = wrapperRomList[i].stem().string();
+								focusBegin(selected);
+								if(ImGui::Selectable(label.c_str(), selected)) {
+									wrapperRomListSelected = i;
+									activateRom = true;
+								}
+								focusEnd(selected);
+								if(selected && lastScrolledRom != wrapperRomListSelected) {
+									ImGui::SetScrollHereY(0.5f);
+									lastScrolledRom = wrapperRomListSelected;
+								}
+							}
+							ImGui::PopItemFlag();
+						}
+						ImGui::EndChild();
+
+						if(activateRom) {
+							QueueWrapperRomOpen(wrapperRomList[wrapperRomListSelected]);
+						}
+					}
+			} else if (wrapperUiTab == TAB_OPTIONS) {
+					if(navDown && wrapperSettingsNav + 1 < SET_COUNT) {
+						++wrapperSettingsNav;
+					}
+					if(navUp && wrapperSettingsNav > 0) {
+						--wrapperSettingsNav;
+					}
+
+					auto scrollIfFocused = [&](bool on, int idx) {
+						if(on && lastSettingsScroll != idx) {
+							ImGui::SetScrollHereY(0.5f);
+							lastSettingsScroll = idx;
+						}
+					};
+
+					if(ImGui::BeginChild("SettingsScroll", ImVec2(0, 0), ImGuiChildFlags_None, ImGuiWindowFlags_NoNav)) {
+						ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+
+						bool f = (wrapperSettingsNav == SET_QUIT);
+						focusBegin(f);
+						if(ImGui::Button("Quit", ImVec2(40, 0)) || (f && navActivate)) {
+							running = false;
+						}
+						focusEnd(f);
+						scrollIfFocused(f, SET_QUIT);
+
+						f = (wrapperSettingsNav == SET_RESET_GAME);
+						focusBegin(f);
+						if(ImGui::Button("Reset game") || (f && navActivate)) {
+							if(romLoaded) {
+								resetQueued = 1;
+								showMenu = false;
+								SyncWrapperMenuInput();
+								joysticks->Reset();
+							}
+						}
+						focusEnd(f);
+						scrollIfFocused(f, SET_RESET_GAME);
+
+						ImGui::Spacing();
+						ImGui::Separator();
+						focusBegin(false);
+						ImGui::TextUnformatted("Settings");
+						focusEnd(false);
+
+						f = (wrapperSettingsNav == SET_OPACITY);
+						focusBegin(f);
+						ImGui::SliderFloat("Opacity", &menuPanelAlpha, 0.20f, 1.0f, "%.2f", ImGuiSliderFlags_NoInput);
+						if(ImGui::IsItemDeactivatedAfterEdit()) MarkWrapperSettingsDirty();
+						focusEnd(f);
+						scrollIfFocused(f, SET_OPACITY);
+						if(f && navDec) { menuPanelAlpha = std::max(0.20f, menuPanelAlpha - 0.05f); MarkWrapperSettingsDirty(); }
+						if(f && navInc) { menuPanelAlpha = std::min(1.0f, menuPanelAlpha + 0.05f); MarkWrapperSettingsDirty(); }
+
+						f = (wrapperSettingsNav == SET_PAUSE);
+						focusBegin(f);
+						{
+							bool pauseVal = pauseWhenMenuOpen;
+							if(ImGui::Checkbox("Pause when open", &pauseVal)) {
+								pauseWhenMenuOpen = pauseVal;
+								MarkWrapperSettingsDirty();
+							} else if(f && navActivate) {
+								pauseWhenMenuOpen = !pauseWhenMenuOpen;
+								MarkWrapperSettingsDirty();
+							}
+						}
+						focusEnd(f);
+						scrollIfFocused(f, SET_PAUSE);
+
+						focusBegin(false);
+						ImGui::TextUnformatted("Image size");
+						focusEnd(false);
+						f = (wrapperSettingsNav == SET_SCALE_1X);
+						focusBegin(f);
+						if(ImGui::RadioButton("1x", display_scale == 1) || (f && navActivate)) {
+							display_scale = 1;
+							MarkWrapperSettingsDirty();
+						}
+						focusEnd(f);
+						scrollIfFocused(f, SET_SCALE_1X);
+						f = (wrapperSettingsNav == SET_SCALE_2X);
+						focusBegin(f);
+						if(ImGui::RadioButton("2x", display_scale == 2) || (f && navActivate)) {
+							display_scale = 2;
+							MarkWrapperSettingsDirty();
+						}
+						focusEnd(f);
+						scrollIfFocused(f, SET_SCALE_2X);
+
+						f = (wrapperSettingsNav == SET_OFF_X);
+						focusBegin(f);
+						ImGui::SliderInt("Offset X", &imageOffsetX, -64, 64, "%d", ImGuiSliderFlags_NoInput);
+						if(ImGui::IsItemDeactivatedAfterEdit()) MarkWrapperSettingsDirty();
+						focusEnd(f);
+						scrollIfFocused(f, SET_OFF_X);
+						if(f && navDec) { imageOffsetX = std::max(-64, imageOffsetX - 1); MarkWrapperSettingsDirty(); }
+						if(f && navInc) { imageOffsetX = std::min(64, imageOffsetX + 1); MarkWrapperSettingsDirty(); }
+
+						f = (wrapperSettingsNav == SET_OFF_Y);
+						focusBegin(f);
+						ImGui::SliderInt("Offset Y", &imageOffsetY, -64, 64, "%d", ImGuiSliderFlags_NoInput);
+						if(ImGui::IsItemDeactivatedAfterEdit()) MarkWrapperSettingsDirty();
+						focusEnd(f);
+						scrollIfFocused(f, SET_OFF_Y);
+						if(f && navDec) { imageOffsetY = std::max(-64, imageOffsetY - 1); MarkWrapperSettingsDirty(); }
+						if(f && navInc) { imageOffsetY = std::min(64, imageOffsetY + 1); MarkWrapperSettingsDirty(); }
+
+						ImGui::Spacing();
+						ImGui::Separator();
+						focusBegin(false);
+						ImGui::TextUnformatted("Palette");
+						focusEnd(false);
+						f = (wrapperSettingsNav == SET_PAL_CAPTURE);
+						focusBegin(f);
+						if(ImGui::RadioButton("Unscaled Capture", palette_select == PALETTE_SELECT_CAPTURE) || (f && navActivate)) {
+							palette_select = PALETTE_SELECT_CAPTURE;
+							RefreshPaletteBuffers();
+							MarkWrapperSettingsDirty();
+						}
+						focusEnd(f);
+						scrollIfFocused(f, SET_PAL_CAPTURE);
+
+						f = (wrapperSettingsNav == SET_PAL_SCALED);
+						focusBegin(f);
+						if(ImGui::RadioButton("Full Contrast", palette_select == PALETTE_SELECT_SCALED) || (f && navActivate)) {
+							palette_select = PALETTE_SELECT_SCALED;
+							RefreshPaletteBuffers();
+							MarkWrapperSettingsDirty();
+						}
+						focusEnd(f);
+						scrollIfFocused(f, SET_PAL_SCALED);
+
+						f = (wrapperSettingsNav == SET_PAL_HDMI);
+						focusBegin(f);
+						if(ImGui::RadioButton("Cheap HDMI", palette_select == PALETTE_SELECT_HDMI) || (f && navActivate)) {
+							palette_select = PALETTE_SELECT_HDMI;
+							RefreshPaletteBuffers();
+							MarkWrapperSettingsDirty();
+						}
+						focusEnd(f);
+						scrollIfFocused(f, SET_PAL_HDMI);
+
+						f = (wrapperSettingsNav == SET_PAL_OLD);
+						focusBegin(f);
+						if(ImGui::RadioButton("Legacy", palette_select == PALETTE_SELECT_OLD) || (f && navActivate)) {
+							palette_select = PALETTE_SELECT_OLD;
+							RefreshPaletteBuffers();
+							MarkWrapperSettingsDirty();
+						}
+						focusEnd(f);
+						scrollIfFocused(f, SET_PAL_OLD);
+
+						ImGui::Spacing();
+						ImGui::Separator();
+						focusBegin(false);
+						ImGui::TextUnformatted("Audio");
+						focusEnd(false);
+						f = (wrapperSettingsNav == SET_VOLUME);
+						focusBegin(f);
+						ImGui::SliderInt("Volume", &AudioCoprocessor::singleton_acp_state->volume, 0, 256, "%d", ImGuiSliderFlags_NoInput);
+						if(ImGui::IsItemDeactivatedAfterEdit()) MarkWrapperSettingsDirty();
+						focusEnd(f);
+						scrollIfFocused(f, SET_VOLUME);
+						if(f && navDec) {
+							AudioCoprocessor::singleton_acp_state->volume = std::max(0, AudioCoprocessor::singleton_acp_state->volume - 8);
+							MarkWrapperSettingsDirty();
+						}
+						if(f && navInc) {
+							AudioCoprocessor::singleton_acp_state->volume = std::min(256, AudioCoprocessor::singleton_acp_state->volume + 8);
+							MarkWrapperSettingsDirty();
+						}
+
+						f = (wrapperSettingsNav == SET_MUTE);
+						focusBegin(f);
+						{
+							bool appMute = (muteMask & MUTE_SOURCE_MANUAL) != 0;
+							bool changed = ImGui::Checkbox("Mute", &appMute);
+							if(f && navActivate) {
+								appMute = !appMute;
+								changed = true;
+							}
+							if(changed) {
+								if(appMute) muteMask |= MUTE_SOURCE_MANUAL;
+								else muteMask &= ~MUTE_SOURCE_MANUAL;
+								AudioCoprocessor::singleton_acp_state->isMuted = (muteMask != 0);
+								MarkWrapperSettingsDirty();
+							}
+						}
+						focusEnd(f);
+						scrollIfFocused(f, SET_MUTE);
+
+						ImGui::PopItemFlag();
+					}
+					ImGui::EndChild();
+			} else if (wrapperUiTab == TAB_CONTROLLER) {
+					if(navDown && wrapperCtrlNav + 1 < CTRL_COUNT) {
+						++wrapperCtrlNav;
+					}
+					if(navUp && wrapperCtrlNav > 0) {
+						--wrapperCtrlNav;
+					}
+					if(onCtrlMapRow) {
+						if(navDec) wrapperCtrlCol = 0;
+						if(navInc) wrapperCtrlCol = 1;
+					}
+
+					focusBegin(false);
+					ImGui::TextWrapped("%s", WrapperControllerName());
+					focusEnd(false);
+					ImGui::Separator();
+					if(wrapperRemapListening) {
+						focusBegin(true);
+						ImGui::TextUnformatted(wrapperRemapConflict ? "Already mapped" : "Press a button...");
+						focusEnd(true);
+					}
+
+					auto startRemap = [&](int target) {
+						wrapperRemapListening = true;
+						wrapperRemapTarget = target;
+						wrapperRemapConflict = false;
+						SyncWrapperMenuInput();
+					};
+
+					auto scrollCtrl = [&](bool on, int idx) {
+						if(on && lastCtrlScroll != idx) {
+							ImGui::SetScrollHereY(0.5f);
+							lastCtrlScroll = idx;
+						}
+					};
+
+					const float setW = 28.0f;
+					const float clrW = 28.0f;
+					const float rowBtnGap = 4.0f;
+
+					if(ImGui::BeginChild("ControllerScroll", ImVec2(0, -28), ImGuiChildFlags_None, ImGuiWindowFlags_NoNav)) {
+						ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+
+						auto drawMapRow = [&](int navIdx, const char* label, const std::string& mapping, int remapTarget, auto onClear) {
+							const bool rowFocus = (wrapperCtrlNav == navIdx);
+							const bool listeningHere = wrapperRemapListening && (wrapperRemapTarget == remapTarget);
+							const bool setFocus = rowFocus && wrapperCtrlCol == 0;
+							const bool clrFocus = rowFocus && wrapperCtrlCol == 1;
+							ImGui::PushID(navIdx);
+
+							const float rowW = ImGui::GetContentRegionAvail().x;
+							const float labelW = 42.0f;
+							const float mapW = std::max(24.0f, rowW - labelW - setW - clrW - rowBtnGap * 2 - 4.0f);
+
+							focusBegin(rowFocus);
+							ImGui::TextUnformatted(label);
+							focusEnd(rowFocus);
+							ImGui::SameLine(labelW);
+							focusBegin(rowFocus);
+							if(listeningHere) {
+								ImGui::TextUnformatted("...");
+							} else {
+								ImGui::TextUnformatted(mapping.c_str());
+							}
+							focusEnd(rowFocus);
+							ImGui::SameLine(labelW + mapW);
+							focusBegin(setFocus);
+							if(ImGui::Button("Set", ImVec2(setW, 0)) || (setFocus && navActivate)) {
+								startRemap(remapTarget);
+							}
+							focusEnd(setFocus);
+							ImGui::SameLine(0.0f, rowBtnGap);
+							focusBegin(clrFocus);
+							if(ImGui::Button("Clr", ImVec2(clrW, 0)) || (clrFocus && navActivate)) {
+								onClear();
+								CancelWrapperRemap();
+							}
+							focusEnd(clrFocus);
+							scrollCtrl(rowFocus, navIdx);
+							ImGui::PopID();
+						};
+
+						drawMapRow(CTRL_UP, "Up", BindingTextForButton(GameTankButtons::P1_UP), GameTankButtons::P1_UP,
+							[]{ ClearBindingsForButton(GameTankButtons::P1_UP); });
+						drawMapRow(CTRL_DOWN, "Down", BindingTextForButton(GameTankButtons::P1_DOWN), GameTankButtons::P1_DOWN,
+							[]{ ClearBindingsForButton(GameTankButtons::P1_DOWN); });
+						drawMapRow(CTRL_LEFT, "Left", BindingTextForButton(GameTankButtons::P1_LEFT), GameTankButtons::P1_LEFT,
+							[]{ ClearBindingsForButton(GameTankButtons::P1_LEFT); });
+						drawMapRow(CTRL_RIGHT, "Right", BindingTextForButton(GameTankButtons::P1_RIGHT), GameTankButtons::P1_RIGHT,
+							[]{ ClearBindingsForButton(GameTankButtons::P1_RIGHT); });
+						drawMapRow(CTRL_A, "A", BindingTextForButton(GameTankButtons::P1_A), GameTankButtons::P1_A,
+							[]{ ClearBindingsForButton(GameTankButtons::P1_A); });
+						drawMapRow(CTRL_B, "B", BindingTextForButton(GameTankButtons::P1_B), GameTankButtons::P1_B,
+							[]{ ClearBindingsForButton(GameTankButtons::P1_B); });
+						drawMapRow(CTRL_C, "C", BindingTextForButton(GameTankButtons::P1_C), GameTankButtons::P1_C,
+							[]{ ClearBindingsForButton(GameTankButtons::P1_C); });
+						drawMapRow(CTRL_START, "Start", BindingTextForButton(GameTankButtons::P1_START), GameTankButtons::P1_START,
+							[]{ ClearBindingsForButton(GameTankButtons::P1_START); });
+
+						ImGui::PopItemFlag();
+					}
+					ImGui::EndChild();
+
+					{
+						const bool resetFocus = (wrapperCtrlNav == CTRL_RESET_ALL);
+						focusBegin(resetFocus);
+						if(ImGui::Button("Reset all") || (resetFocus && navActivate)) {
+							ResetWrapperControllerBindings();
+						}
+						focusEnd(resetFocus);
+						if(resetFocus && lastCtrlScroll != wrapperCtrlNav) {
+							lastCtrlScroll = wrapperCtrlNav;
+						}
+					}
+			}
+		}
+		ImGui::EndChild();
 
 		ImGui::End();
+		ImGui::PopStyleVar(6);
 #endif
 	}
 	ImGui::Render();
@@ -1215,7 +2420,7 @@ else {
 #endif
 
 #ifdef WRAPPER_MODE
-	if(!paused && !showMenu) {
+	if(!paused && !(showMenu && pauseWhenMenuOpen)) {
 #else
 	if(!paused) {
 #endif
@@ -1362,6 +2567,11 @@ else {
 			}
 #endif //WRAPPER_MODE
 #endif //WASM_BUILD
+#ifdef WRAPPER_MODE
+			if(TryCaptureWrapperRemap(e)) {
+				continue;
+			}
+#endif
             //User requests quit
             if( e.type == SDL_QUIT )
             {
@@ -1396,11 +2606,18 @@ else {
 							case SDLK_ESCAPE:
 	#if !defined(DISABLE_ESC)
 								if(e.type == SDL_KEYDOWN) {
+#ifdef WRAPPER_MODE
+									if(wrapperRemapListening) {
+										CancelWrapperRemap();
+										SyncWrapperMenuInput();
+										break;
+									}
+#endif
 									showMenu = !showMenu;
 									menuOpening = showMenu;
-	#ifdef WRAPPER_MODE
-									setMenuMute(showMenu);
-	#endif
+#ifdef WRAPPER_MODE
+									if(!showMenu) CancelWrapperRemap();
+#endif
 								}
 								#endif
 								break;
@@ -1446,15 +2663,48 @@ else {
 
 		if(joysticks->CheckSystemButtonPressed()) {
 	#if !defined(DISABLE_ESC)
-									showMenu = !showMenu;
-									menuOpening = showMenu;
-	#ifdef WRAPPER_MODE
-									setMenuMute(showMenu);
-	#endif
+#ifdef WRAPPER_MODE
+			if(wrapperRemapListening) {
+				CancelWrapperRemap();
+				SyncWrapperMenuInput();
+			} else {
+				showMenu = !showMenu;
+				menuOpening = showMenu;
+				if(!showMenu) CancelWrapperRemap();
+			}
+#else
+			showMenu = !showMenu;
+			menuOpening = showMenu;
+#endif
 	#endif
 		}
+#ifdef WRAPPER_MODE
+		{
+			static bool wasMenuOpen = false;
+			if(wasMenuOpen && !showMenu) {
+				SaveWrapperSettings();
+			}
+			wasMenuOpen = showMenu;
+		}
+		{
+			const bool wantMenuMute = showMenu && pauseWhenMenuOpen;
+			const bool haveMenuMute = (muteMask & MUTE_SOURCE_MENU) != 0;
+			if(wantMenuMute != haveMenuMute) {
+				setMenuMute(wantMenuMute);
+			}
+		}
+		{
+			int paletteDir = joysticks->CheckPaletteCycle();
+			if(paletteDir != 0 && !showMenu) {
+				CycleWrapperPalette(paletteDir);
+			}
+		}
+#endif
 
 		refreshScreen();
+#ifdef WRAPPER_MODE
+		ProcessQueuedWrapperRomOpen();
+#endif
 		SDL_UpdateWindowSurface(mainWindow);
 
 #ifndef WASM_BUILD
@@ -1472,6 +2722,9 @@ else {
 #endif
 		
 	if(!running) {
+#ifdef WRAPPER_MODE
+		SaveWrapperSettings();
+#endif
 #ifdef WASM_BUILD
 		emscripten_cancel_main_loop();
 #else
@@ -1565,9 +2818,23 @@ int main(int argC, char* argV[]) {
 	SDL_SetColorKey(vRAM_Surface, SDL_FALSE, 0);
 	SDL_SetColorKey(gRAM_Surface, SDL_FALSE, 0);
 
+#if defined(WRAPPER_MODE) && defined(CONSOLE_DISPLAY_CRT)
+	const int console_w = 342;
+	const int console_h = 256;
+	mainWindow = SDL_CreateWindow(WINDOW_TITLE, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, console_w, console_h, SDL_WINDOW_SHOWN);
+	SDL_SetWindowMinimumSize(mainWindow, console_w, console_h);
+	SDL_SetWindowMaximumSize(mainWindow, console_w, console_h);
+#elif defined(WRAPPER_MODE) && defined(CONSOLE_DISPLAY_FULLSCREEN)
+	mainWindow = SDL_CreateWindow(WINDOW_TITLE, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, viewport_width(display_scale), viewport_height(display_scale), SDL_WINDOW_SHOWN);
+#else
 	mainWindow = SDL_CreateWindow(WINDOW_TITLE, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, viewport_width(display_scale), viewport_height(display_scale), SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
 	SDL_SetWindowMinimumSize(mainWindow, viewport_width(MIN_DISPLAY_SCALE), viewport_height(MIN_DISPLAY_SCALE));
+#endif
 	mainRenderer = SDL_CreateRenderer(mainWindow, -1, EmulatorConfig::defaultRendererFlags);
+#if defined(WRAPPER_MODE) && defined(CONSOLE_DISPLAY_FULLSCREEN)
+	SDL_SetWindowFullscreen(mainWindow, SDL_WINDOW_FULLSCREEN_DESKTOP);
+	isFullScreen = true;
+#endif
 	framebufferTexture = SDL_CreateTexture(mainRenderer, SDL_PIXELFORMAT_RGB888, SDL_TEXTUREACCESS_STREAMING, GT_WIDTH, GT_HEIGHT * 2);
 	SDL_SetTextureScaleMode(framebufferTexture, SDL_ScaleModeNearest);
 
@@ -1580,6 +2847,21 @@ int main(int argC, char* argV[]) {
 	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 	io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
 	io.Fonts->Flags |= ImFontAtlasFlags_NoBakedLines;
+#ifdef WRAPPER_MODE
+	{
+		ImFontConfig font_cfg;
+		font_cfg.PixelSnapH = true;
+		font_cfg.OversampleH = 1;
+		font_cfg.OversampleV = 1;
+		font_cfg.FontDataOwnedByAtlas = false; // static embedded blob
+		ImFont* proggy = io.Fonts->AddFontFromMemoryTTF(
+			(void*)font_proggy_tiny_ttf, (int)font_proggy_tiny_ttf_len, 10.0f, &font_cfg);
+		if(!proggy) {
+			printf("Failed to load embedded ProggyTiny font; using default ImGui font\n");
+			io.Fonts->AddFontDefault();
+		}
+	}
+#endif
 	ImGui::StyleColorsDark();
 	ImGui_ImplSDL2_InitForSDLRenderer(mainWindow, mainRenderer);
 	ImGui_ImplSDL2_SetGamepadMode(ImGui_ImplSDL2_GamepadMode_Manual);
@@ -1588,6 +2870,10 @@ int main(int argC, char* argV[]) {
 
 	//Init joystick handler AFTER init imgui
 	joysticks = new JoystickAdapter();
+#ifdef WRAPPER_MODE
+	LoadWrapperTabIcons();
+	LoadWrapperSettings();
+#endif
 
 	#if SDL_BYTEORDER == SDL_BIG_ENDIAN
 	    rmask = 0xff000000;
@@ -1603,6 +2889,24 @@ int main(int argC, char* argV[]) {
 
 	randomize_vram();
 
+#ifdef WRAPPER_MODE
+	if(!rom_file_name) {
+		showMenu = false;
+		romLoaded = false;
+		PauseEmulation();
+		RefreshWrapperRomList();
+	} else if(LoadRomFile(rom_file_name) == -1) {
+		showMenu = false;
+		romLoaded = false;
+		PauseEmulation();
+		RefreshWrapperRomList();
+		printf("Failed to load ROM\n");
+	} else {
+		romLoaded = true;
+		showMenu = false;
+		ResumeEmulation();
+	}
+#else
 	if(!rom_file_name || LoadRomFile(rom_file_name) == -1) {
 		PauseEmulation();
 #ifdef TINYFILEDIALOGS_H
@@ -1616,6 +2920,7 @@ int main(int argC, char* argV[]) {
 	} else {
 		ResumeEmulation();
 	}
+#endif
 
 #ifdef WASM_BUILD
 
