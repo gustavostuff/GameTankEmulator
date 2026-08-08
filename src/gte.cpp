@@ -906,39 +906,39 @@ void RefreshWrapperRomList() {
 	printf("Found %zu ROM(s) in %s\n", wrapperRomList.size(), romsDir.c_str());
 }
 
-void CloseWrapperRom() {
-	PauseEmulation();
-	romLoaded = false;
-	cartridge_state.write_mode = false;
-	if(joysticks) {
-		joysticks->SetHeldButtons(0);
-		joysticks->Reset();
-	}
-	// Clear cartridge buffer so a smaller ROM cannot leave stale bytes behind
-	if(cartridge_state.rom) {
-		memset(cartridge_state.rom, 0xFF, 1 << 21);
-	}
-	cartridge_state.size = 0;
-	loadedRomType = RomType::UNKNOWN;
-}
-
 bool OpenWrapperRom(const std::filesystem::path& path) {
 	const std::string pathStr = path.string();
 	printf("Opening ROM: %s\n", pathStr.c_str());
 
-	// Stop the current game cleanly before loading another (or the same) ROM
-	CloseWrapperRom();
+	// Pause while swapping so the old game does not keep running mid-load.
+	// Do not wipe the cartridge until the new file is confirmed loaded.
+	PauseEmulation();
+	if(joysticks) {
+		joysticks->SetHeldButtons(0);
+		joysticks->Reset();
+	}
+	cartridge_state.write_mode = false;
 
 	if(LoadRomFile(pathStr.c_str()) != 0) {
 		printf("Failed to load ROM: %s\n", pathStr.c_str());
+		// Keep whatever was already in memory and unstick pause so the UI is usable
+		ResumeEmulation();
 		return false;
 	}
+
+	// Bytes past the new ROM size must not keep data from a previous larger cart
+	if(cartridge_state.rom && cartridge_state.size > 0 && cartridge_state.size < (1 << 21)) {
+		memset(cartridge_state.rom + cartridge_state.size, 0xFF, (size_t)((1 << 21) - cartridge_state.size));
+	}
+
 	romLoaded = true;
 	showMenu = false;
 	SyncWrapperMenuInput();
 	cpu_core->Reset();
 	cartridge_state.write_mode = false;
-	joysticks->Reset();
+	if(joysticks) {
+		joysticks->Reset();
+	}
 	ResumeEmulation();
 	return true;
 }
