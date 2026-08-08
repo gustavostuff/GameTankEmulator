@@ -2,7 +2,7 @@
 
 Fork of the [upstream GameTank Emulator](https://github.com/clydeshaffer/GameTankEmulator) with a **CRT-friendly**, controller-first WRAPPER UI for **Raspberry Pi / ARM64** (RGB-Pi and similar).
 
-Built for low-res CRT output: compact overlay, pixel font, fixed game image scale, and gamepad navigation. Press **Select** to open the menu (ROM list, options, remapping). Menu toggle is always Select.
+Built for low-res CRT output: compact overlay, pixel font, fixed game image scale, and gamepad navigation. Press **Select** to open the menu (ROM list, options, remapping).
 
 ## Releases (Raspberry Pi / ARM64)
 
@@ -17,7 +17,7 @@ GameTank/
 ```
 
 1. Put `.gtr` ROMs in `GameTank/roms/`
-2. Place `GameTank/` where you want it (e.g. under your RGB-Pi ports folder) and run `GameTank/GameTankEmulator`
+2. Place `GameTank/` where you want it (e.g. under your RGB-Pi ports folder) and run `GameTank/GameTankEmulator`, from wherever you need to (like a shell script).
 
 ## Build on the Pi
 
@@ -29,7 +29,7 @@ curl -fsSL https://raw.githubusercontent.com/gustavostuff/GameTankEmulator/main/
 
 This clones the repo, builds the ARM64 WRAPPER binary, and writes a `GameTank/` package (under `/media/usb1/roms/ports/` when that path exists, otherwise `~/GameTank`).
 
-Rebuild later:
+To rebuild later:
 
 ```sh
 bash ~/GameTankEmulator/scripts/linux/install-rgbpi.sh
@@ -45,15 +45,4 @@ bash ~/GameTankEmulator/scripts/linux/install-rgbpi.sh
 | B / X | Adjust / Clr (context-dependent) |
 | L / R shoulders | Cycle tabs (in menu) or palettes (in game) |
 
-ROMs load from `roms/` next to the binary. Settings and mappings save under the SDL pref path (`…/GameTank/Emulator/`).
-
-## Desktop build (optional)
-
-For development on a normal Linux PC (not the Pi CRT target):
-
-```sh
-git clone --recurse-submodules https://github.com/gustavostuff/GameTankEmulator.git
-cd GameTankEmulator
-make WRAPPERMODE=yes CONSOLE_DISPLAY=crt install
-./bin/GameTankEmulator
-```
+ROMs load from `roms/` next to the binary. Settings and mappings save under the SDL pref path (`.../GameTank/Emulator/`).
