@@ -773,6 +773,7 @@ static const int kWrapperPalettes[] = {
 static const int kWrapperPaletteCount = 4;
 
 extern "C" int LoadRomFile(const char* filename);
+extern "C" void PauseEmulation();
 extern "C" void ResumeEmulation();
 
 void CycleWrapperPalette(int dir) {
