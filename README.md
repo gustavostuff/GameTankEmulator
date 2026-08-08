@@ -27,7 +27,7 @@ SSH into the Pi and paste:
 curl -fsSL https://raw.githubusercontent.com/gustavostuff/GameTankEmulator/main/scripts/linux/install-rgbpi.sh | bash
 ```
 
-This clones the repo, builds the ARM64 WRAPPER binary, and writes a `GameTank/` package (under `/media/usb1/roms/ports/` when that path exists, otherwise `~/GameTank`).
+This clones the repo, builds the ARM64 WRAPPER binary, and writes `~/GameTank`.
 
 To rebuild later:
 
@@ -46,3 +46,5 @@ bash ~/GameTankEmulator/scripts/linux/install-rgbpi.sh
 | L / R shoulders | Cycle tabs (in menu) or palettes (in game) |
 
 ROMs load from `roms/` next to the binary. Settings and mappings save under the SDL pref path (`.../GameTank/Emulator/`).
+
+NOTE: The Pi needs internet access, the script has to clone this repository.
