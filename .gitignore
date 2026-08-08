@@ -10,3 +10,4 @@ roms/*.sav
 *.gtr.bak
 .DS_Store
 *~
+TestOnRGBPiOS4.sh
