@@ -905,9 +905,29 @@ void RefreshWrapperRomList() {
 	printf("Found %zu ROM(s) in %s\n", wrapperRomList.size(), romsDir.c_str());
 }
 
+void CloseWrapperRom() {
+	PauseEmulation();
+	romLoaded = false;
+	cartridge_state.write_mode = false;
+	if(joysticks) {
+		joysticks->SetHeldButtons(0);
+		joysticks->Reset();
+	}
+	// Clear cartridge buffer so a smaller ROM cannot leave stale bytes behind
+	if(cartridge_state.rom) {
+		memset(cartridge_state.rom, 0xFF, 1 << 21);
+	}
+	cartridge_state.size = 0;
+	loadedRomType = RomType::UNKNOWN;
+}
+
 bool OpenWrapperRom(const std::filesystem::path& path) {
 	const std::string pathStr = path.string();
 	printf("Opening ROM: %s\n", pathStr.c_str());
+
+	// Stop the current game cleanly before loading another (or the same) ROM
+	CloseWrapperRom();
+
 	if(LoadRomFile(pathStr.c_str()) != 0) {
 		printf("Failed to load ROM: %s\n", pathStr.c_str());
 		return false;
