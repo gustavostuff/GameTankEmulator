@@ -2014,10 +2014,14 @@ void refreshScreen() {
 		if (ImGui::BeginChild("PanelBody", ImVec2(0, 0), ImGuiChildFlags_None)) {
 			if (wrapperUiTab == TAB_GAMES) {
 					if(wrapperRomList.empty()) {
+						focusBegin(false);
 						ImGui::TextWrapped("No .gtr files in roms/");
-						if(ImGui::Button("Refresh")) {
+						focusEnd(false);
+						focusBegin(true);
+						if(ImGui::Button("Refresh") || navActivate) {
 							RefreshWrapperRomList();
 						}
+						focusEnd(true);
 					} else {
 						bool activateRom = false;
 						if(navDown && wrapperRomListSelected + 1 < (int)wrapperRomList.size()) {
